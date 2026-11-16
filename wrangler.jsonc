@@ -1,0 +1,38 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "nfapi-cofre",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-11-01",
+	"compatibility_flags": ["nodejs_compat"],
+	"observability": { "enabled": true },
+
+	// Segredo obrigatório: o deploy falha se não estiver definido.
+	"secrets": { "required": ["VAULT_SECRET"] },
+
+	// Proxy mTLS: faz a conexão com SEFAZ / NFS-e Nacional usando a cadeia ICP-Brasil.
+	"containers": [
+		{
+			"class_name": "MtlsProxy",
+			"image": "./container/Dockerfile",
+			"instance_type": "lite",
+			"max_instances": 3
+		}
+	],
+	"durable_objects": {
+		"bindings": [{ "name": "MTLS", "class_name": "MtlsProxy" }]
+	},
+	"migrations": [{ "tag": "v1", "new_sqlite_classes": ["MtlsProxy"] }],
+
+	// Certificado cifrado, pareamento, auditoria e índice dos documentos.
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "nfapi-cofre",
+			"database_id": "0953ada4-1ea3-4cff-8e58-9448e684cf8d",
+			"migrations_dir": "migrations"
+		}
+	],
+
+	// XML autorizados, eventos, PDF e o diário de transmissões.
+	"r2_buckets": [{ "binding": "DOCS", "bucket_name": "nfapi-cofre-docs","preview_bucket_name": "nfapi-cofre-docs" }]
+}

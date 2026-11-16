@@ -1,0 +1,375 @@
+// Tela de configuração do cofre, servida em /setup.
+//
+// HTML, CSS e JS são arquivos separados (rotas próprias) para permitir uma CSP
+// sem 'unsafe-inline'. O JS não usa innerHTML: todo texto vindo do servidor
+// entra por textContent.
+
+export const SETUP_HTML = String.raw`<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Cofre NFapi</title>
+<link rel="stylesheet" href="/setup/app.css">
+</head>
+<body>
+<main>
+	<header>
+		<h1>Cofre NFapi</h1>
+		<p class="muted">Seu certificado digital e seus documentos fiscais ficam aqui, na sua conta Cloudflare.</p>
+	</header>
+
+	<section id="login" class="card">
+		<h2>Entrar</h2>
+		<p>Informe o segredo do cofre (<code>VAULT_SECRET</code>) definido na instalação.</p>
+		<form id="login-form">
+			<label for="secret">Segredo do cofre</label>
+			<input id="secret" type="password" autocomplete="off" required>
+			<button type="submit">Entrar</button>
+		</form>
+		<p id="login-error" class="error" role="alert"></p>
+	</section>
+
+	<div id="panel" hidden>
+		<section class="card">
+			<h2>1. Certificado digital A1</h2>
+			<div id="cert-status"></div>
+			<form id="cert-form">
+				<label for="pfx">Arquivo do certificado (.pfx ou .p12)</label>
+				<input id="pfx" type="file" accept=".pfx,.p12" required>
+				<label for="pfx-password">Senha do certificado</label>
+				<input id="pfx-password" type="password" autocomplete="off" required>
+				<div class="row">
+					<button type="submit">Instalar certificado</button>
+					<button type="button" id="cert-remove" class="ghost danger" hidden>Remover</button>
+				</div>
+			</form>
+			<p class="muted small">O arquivo é lido por este cofre, cifrado e gravado no seu banco D1. A senha não é guardada.</p>
+			<p id="cert-message" role="status"></p>
+		</section>
+
+		<section class="card">
+			<h2>2. Teste de conexão</h2>
+			<p>Consulta o status dos serviços de <strong>homologação</strong> usando o certificado instalado. Nenhuma nota é emitida.</p>
+			<button type="button" id="selftest">Testar conexão com o governo</button>
+			<ul id="selftest-results" class="results"></ul>
+		</section>
+
+		<section class="card">
+			<h2>3. Conectar à API NFapi</h2>
+			<p>Gere um código de pareamento e envie-o à API do NFapi (<code>POST /v1/emitentes</code>). Ele autoriza a API a pedir assinaturas e transmissões a este cofre.</p>
+			<form id="pair-form">
+				<label for="pair-label">Nome desta conexão</label>
+				<input id="pair-label" type="text" maxlength="80" placeholder="API NFapi">
+				<button type="submit">Gerar código de pareamento</button>
+			</form>
+			<div id="pair-code-box" hidden>
+				<p class="warn">Copie agora: o código aparece uma única vez.</p>
+				<textarea id="pair-code" readonly rows="4"></textarea>
+				<button type="button" id="pair-copy" class="ghost">Copiar código</button>
+			</div>
+			<ul id="pairings" class="results"></ul>
+		</section>
+
+		<section class="card">
+			<h2>4. Ambiente</h2>
+			<p id="env-status"></p>
+			<button type="button" id="env-toggle" class="ghost"></button>
+			<p class="muted small">Enquanto a produção estiver bloqueada, o cofre recusa assinar qualquer documento com valor fiscal.</p>
+		</section>
+
+		<section class="card">
+			<h2>Atividade recente</h2>
+			<div class="table-wrap">
+				<table>
+					<thead><tr><th>Quando</th><th>Ação</th><th>Quem</th><th>Resultado</th></tr></thead>
+					<tbody id="audit"></tbody>
+				</table>
+			</div>
+		</section>
+	</div>
+
+	<footer class="muted small"><span id="version"></span></footer>
+</main>
+<script src="/setup/app.js"></script>
+</body>
+</html>`;
+
+export const SETUP_CSS = String.raw`:root {
+	--bg: #f5f6f8; --card: #ffffff; --text: #16202c; --muted: #5b6776; --line: #d9dee5;
+	--accent: #0b5cd6; --accent-text: #ffffff; --ok: #12773d; --bad: #b3261e; --warn: #8a5300;
+	color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+	:root {
+		--bg: #0f141a; --card: #18202a; --text: #e7ecf2; --muted: #9aa7b6; --line: #2b3643;
+		--accent: #5c9dff; --accent-text: #0b1420; --ok: #5fd08d; --bad: #ff8a80; --warn: #f2b65a;
+	}
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 720px; margin: 0 auto; padding: 24px 16px 48px; }
+header { margin-bottom: 20px; }
+h1 { font-size: 1.6rem; margin: 0 0 4px; }
+h2 { font-size: 1.1rem; margin: 0 0 12px; }
+p { margin: 0 0 12px; }
+code { font-family: ui-monospace, Consolas, monospace; font-size: 0.9em; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+.muted { color: var(--muted); }
+.small { font-size: 0.875rem; }
+.error, .bad { color: var(--bad); }
+.ok { color: var(--ok); }
+.warn { color: var(--warn); font-weight: 600; }
+label { display: block; font-weight: 600; font-size: 0.9rem; margin: 12px 0 4px; }
+input[type="text"], input[type="password"], input[type="file"], textarea {
+	width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px;
+	background: var(--bg); color: var(--text); font: inherit;
+}
+textarea { font-family: ui-monospace, Consolas, monospace; font-size: 0.8rem; word-break: break-all; resize: vertical; }
+button {
+	margin-top: 14px; padding: 10px 16px; border: 1px solid var(--accent); border-radius: 8px;
+	background: var(--accent); color: var(--accent-text); font: inherit; font-weight: 600; cursor: pointer;
+}
+button.ghost { background: transparent; color: var(--accent); }
+button.danger { border-color: var(--bad); color: var(--bad); }
+button:disabled { opacity: 0.6; cursor: progress; }
+button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.row { display: flex; gap: 10px; flex-wrap: wrap; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 0 0 12px; }
+dt { color: var(--muted); }
+dd { margin: 0; overflow-wrap: anywhere; }
+.results { list-style: none; margin: 14px 0 0; padding: 0; }
+.results li { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 0; border-top: 1px solid var(--line); flex-wrap: wrap; }
+.results li button { margin-top: 0; padding: 6px 12px; }
+.results .detail { display: block; color: var(--muted); font-size: 0.875rem; overflow-wrap: anywhere; }
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
+th, td { text-align: left; padding: 6px 10px 6px 0; border-top: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--muted); font-weight: 600; border-top: 0; }
+footer { text-align: center; margin-top: 24px; }
+[hidden] { display: none !important; }`;
+
+export const SETUP_JS = String.raw`(function () {
+	"use strict";
+	var secret = "";
+	var state = null;
+	var $ = function (id) { return document.getElementById(id); };
+
+	function el(tag, props, children) {
+		var node = document.createElement(tag);
+		Object.keys(props || {}).forEach(function (k) {
+			if (k === "text") node.textContent = props[k];
+			else if (k === "onclick") node.addEventListener("click", props[k]);
+			else node.setAttribute(k, props[k]);
+		});
+		(children || []).forEach(function (c) { node.appendChild(c); });
+		return node;
+	}
+	function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+	function date(iso) { return new Date(iso).toLocaleString("pt-BR"); }
+
+	async function api(method, path, body) {
+		var init = { method: method, headers: { authorization: "Bearer " + secret } };
+		if (body instanceof FormData) init.body = body;
+		else if (body !== undefined) {
+			init.headers["content-type"] = "application/json";
+			init.body = JSON.stringify(body);
+		}
+		var res = await fetch(path, init);
+		var json = await res.json().catch(function () { return null; });
+		if (!res.ok) {
+			var err = new Error((json && json.error && json.error.message) || ("Erro HTTP " + res.status));
+			err.status = res.status;
+			throw err;
+		}
+		return json;
+	}
+
+	async function busy(button, task) {
+		button.disabled = true;
+		try { return await task(); } finally { button.disabled = false; }
+	}
+
+	function message(id, text, kind) {
+		var node = $(id);
+		node.textContent = text;
+		node.className = kind || "";
+	}
+
+	function renderCertificate() {
+		var box = $("cert-status");
+		clear(box);
+		var cert = state.certificate;
+		$("cert-remove").hidden = !cert;
+		if (!cert) {
+			box.appendChild(el("p", { text: "Nenhum certificado instalado.", class: "warn" }));
+			return;
+		}
+		var days = Math.floor((new Date(cert.notAfter) - Date.now()) / 86400000);
+		var validity = date(cert.notAfter) + (days < 0 ? " — VENCIDO" : " — faltam " + days + " dias");
+		var rows = [
+			["Titular", cert.commonName],
+			[cert.holder.kind.toUpperCase(), cert.holder.id],
+			["Emissor", cert.issuer],
+			["Validade", validity],
+			["Instalado em", date(cert.installedAt)]
+		];
+		var dl = el("dl");
+		rows.forEach(function (r) {
+			dl.appendChild(el("dt", { text: r[0] }));
+			dl.appendChild(el("dd", { text: r[1], class: r[0] === "Validade" && days < 30 ? "warn" : "" }));
+		});
+		box.appendChild(dl);
+	}
+
+	function renderEnvironment() {
+		var on = state.allowProduction;
+		$("env-status").textContent = on
+			? "Produção LIBERADA: este cofre assina documentos com valor fiscal."
+			: "Produção bloqueada: este cofre só assina documentos de homologação.";
+		$("env-status").className = on ? "warn" : "ok";
+		$("env-toggle").textContent = on ? "Bloquear produção" : "Liberar produção";
+	}
+
+	function renderPairings() {
+		var list = $("pairings");
+		clear(list);
+		state.pairings.forEach(function (p) {
+			var info = el("span", {}, [
+				el("strong", { text: p.label }),
+				el("span", {
+					class: "detail",
+					text: p.revokedAt
+						? "Revogado em " + date(p.revokedAt)
+						: "Criado em " + date(p.createdAt) + (p.lastUsedAt ? " · último uso " + date(p.lastUsedAt) : " · nunca usado")
+				})
+			]);
+			var item = el("li", {}, [info]);
+			if (!p.revokedAt) {
+				item.appendChild(el("button", {
+					type: "button", class: "ghost danger", text: "Revogar",
+					onclick: async function (ev) {
+						if (!confirm("Revogar a conexão \"" + p.label + "\"? A API deixará de conseguir usar este cofre.")) return;
+						await busy(ev.currentTarget, function () { return api("DELETE", "/admin/pairings/" + p.id); });
+						await refresh();
+					}
+				}));
+			}
+			list.appendChild(item);
+		});
+	}
+
+	async function renderAudit() {
+		var data = await api("GET", "/admin/audit?limit=30");
+		var body = $("audit");
+		clear(body);
+		data.entries.forEach(function (e) {
+			body.appendChild(el("tr", {}, [
+				el("td", { text: date(e.at) }),
+				el("td", { text: e.action }),
+				el("td", { text: e.actor }),
+				el("td", { text: e.outcome, class: e.outcome === "ok" ? "ok" : "bad" })
+			]));
+		});
+	}
+
+	async function refresh() {
+		state = await api("GET", "/admin/status");
+		$("version").textContent = "Cofre NFapi v" + state.version + " · protocolo " + state.protocol;
+		renderCertificate();
+		renderEnvironment();
+		renderPairings();
+		await renderAudit();
+	}
+
+	$("login-form").addEventListener("submit", async function (ev) {
+		ev.preventDefault();
+		secret = $("secret").value.trim();
+		message("login-error", "");
+		try {
+			await refresh();
+			$("secret").value = "";
+			$("login").hidden = true;
+			$("panel").hidden = false;
+		} catch (err) {
+			secret = "";
+			message("login-error", err.message, "error");
+		}
+	});
+
+	$("cert-form").addEventListener("submit", async function (ev) {
+		ev.preventDefault();
+		var form = new FormData();
+		form.append("pfx", $("pfx").files[0]);
+		form.append("password", $("pfx-password").value);
+		message("cert-message", "Lendo o certificado…");
+		try {
+			await busy(ev.submitter, function () { return api("POST", "/admin/certificate", form); });
+			$("pfx").value = "";
+			$("pfx-password").value = "";
+			message("cert-message", "Certificado instalado.", "ok");
+			await refresh();
+		} catch (err) {
+			message("cert-message", err.message, "error");
+		}
+	});
+
+	$("cert-remove").addEventListener("click", async function (ev) {
+		if (!confirm("Remover o certificado do cofre? As emissões param até você instalar outro.")) return;
+		await busy(ev.currentTarget, function () { return api("DELETE", "/admin/certificate"); });
+		message("cert-message", "Certificado removido.");
+		await refresh();
+	});
+
+	$("selftest").addEventListener("click", async function (ev) {
+		var list = $("selftest-results");
+		clear(list);
+		list.appendChild(el("li", { text: "Testando… a primeira conexão pode levar alguns segundos." }));
+		try {
+			var data = await busy(ev.currentTarget, function () { return api("POST", "/admin/selftest"); });
+			clear(list);
+			data.results.forEach(function (r) {
+				list.appendChild(el("li", {}, [
+					el("span", {}, [
+						el("strong", { text: r.name }),
+						el("span", { class: "detail", text: r.detail })
+					]),
+					el("span", { class: r.ok ? "ok" : "bad", text: r.ok ? "OK" : "Falhou" })
+				]));
+			});
+		} catch (err) {
+			clear(list);
+			list.appendChild(el("li", { class: "bad", text: err.message }));
+		}
+		await renderAudit();
+	});
+
+	$("pair-form").addEventListener("submit", async function (ev) {
+		ev.preventDefault();
+		var data = await busy(ev.submitter, function () {
+			return api("POST", "/admin/pairings", { label: $("pair-label").value });
+		});
+		$("pair-code").value = data.code;
+		$("pair-code-box").hidden = false;
+		$("pair-label").value = "";
+		await refresh();
+	});
+
+	$("pair-copy").addEventListener("click", async function () {
+		$("pair-code").select();
+		try {
+			await navigator.clipboard.writeText($("pair-code").value);
+			$("pair-copy").textContent = "Copiado";
+		} catch (e) {
+			document.execCommand("copy");
+		}
+	});
+
+	$("env-toggle").addEventListener("click", async function (ev) {
+		var next = !state.allowProduction;
+		if (next && !confirm("Liberar a produção? A partir de agora o cofre assina notas com valor fiscal.")) return;
+		await busy(ev.currentTarget, function () { return api("PUT", "/admin/settings", { allowProduction: next }); });
+		await refresh();
+	});
+})();`;
