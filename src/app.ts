@@ -1,37 +1,21 @@
 // Rotas do cofre.
 //
 //   /setup, /admin/*  -> o emitente, autenticado pelo VAULT_SECRET
-//   /v1/*             -> a API central, autenticada por HMAC (pareamento)
+//   /v1/nfse...       -> os sistemas do emitente, com chave de API (api-nfse.ts)
 //
-// O cofre só oferece operações tipadas: assinar um elemento fiscal do próprio
-// emitente, transmitir para o governo e guardar documentos.
+// O cofre é a API de emissão: guarda o certificado, monta e assina os
+// documentos, fala com o governo e arquiva os XML. Não há serviço intermediário.
 
-import { type Context, Hono, type MiddlewareHandler } from "hono";
-import { cancelarPeloPainel, ehApiDeCliente, registrarApiNfse } from "./api-nfse";
-import { isAdminSecret, pairingKey, secretIsStrong } from "./crypto";
+import { type Context, Hono } from "hono";
+import { cancelarPeloPainel, registrarApiNfse } from "./api-nfse";
+import { registrarAtualizacao } from "./atualizacao";
+import { isAdminSecret, secretIsStrong } from "./crypto";
 import { PfxError, parsePfx } from "./pfx";
-import {
-	type ErrorBody,
-	HEADERS,
-	type HealthResponse,
-	MAX_CLOCK_SKEW_SECONDS,
-	PROTOCOL_VERSION,
-	type SignRequest,
-	type SignResponse,
-	type TransmitRequest,
-	type TransmitResponse,
-	VAULT_VERSION,
-	encodePairingCode,
-	sha256Hex,
-	signRequest,
-	toHex,
-	verifySignature,
-} from "./protocol";
+import { VAULT_VERSION } from "./protocol";
 import { runSelfTest } from "./selftest";
 import { SETUP_CSS, SETUP_HTML, SETUP_JS } from "./setup/page";
-import { SIGNABLE_TAGS, SignError, signXml } from "./signer";
 import * as store from "./store";
-import { type Transport, TransportError, assertTransmittable } from "./transport";
+import type { Transport } from "./transport";
 
 export interface AppEnv {
 	DB: D1Database;
@@ -39,33 +23,19 @@ export interface AppEnv {
 	VAULT_SECRET: string;
 }
 
-export type Ctx = { Bindings: AppEnv; Variables: { body: ArrayBuffer; actor: string } };
+export type Ctx = { Bindings: AppEnv; Variables: { actor: string } };
 type C = Context<Ctx>;
-type Status = 400 | 401 | 403 | 404 | 409 | 413 | 422 | 429 | 500 | 502 | 503 | 504;
-
-const MAX_BODY_BYTES = 10 * 1024 * 1024;
-const MAX_PFX_BYTES = 64 * 1024;
-const STATUSES: readonly number[] = [400, 401, 403, 404, 409, 413, 422, 429, 500, 502, 503, 504];
-
-/** API usada pelo botão "Criar minha conta" quando o emitente não informa outra. */
-export const DEFAULT_API_URL = "https://api.nfapi.queven.app";
+type Status = 400 | 401 | 404 | 409 | 413 | 422 | 500 | 503;
 
 export interface AppDeps {
-	/** Como o cofre alcança a API no cadastro. Trocado nos testes. */
+	/** Chamadas de saída que não vão ao governo (GitHub, Cloudflare). Trocado nos testes. */
 	fetch?: typeof fetch;
 }
 
-function fail(c: C, status: Status, code: string, message: string) {
-	return c.json<ErrorBody>({ error: { code, message } }, status);
-}
+const MAX_PFX_BYTES = 64 * 1024;
 
-/** Tarefas que não precisam segurar a resposta (fora do Workers, espera normalmente). */
-async function background(c: C, task: Promise<unknown>) {
-	try {
-		c.executionCtx.waitUntil(task.catch(() => undefined));
-	} catch {
-		await task.catch(() => undefined);
-	}
+function fail(c: C, status: Status, code: string, message: string) {
+	return c.json({ error: { code, message } }, status);
 }
 
 function parseJson<T>(body: ArrayBuffer): T | undefined {
@@ -79,7 +49,7 @@ function parseJson<T>(body: ArrayBuffer): T | undefined {
 
 export function createApp(makeTransport: (env: AppEnv) => Transport, deps: AppDeps = {}) {
 	const app = new Hono<Ctx>();
-	const callApi: typeof fetch = deps.fetch ?? ((input, init) => fetch(input, init));
+	const callFetch: typeof fetch = deps.fetch ?? ((input, init) => fetch(input, init));
 
 	app.onError((err, c) => {
 		console.error("erro não tratado:", err instanceof Error ? err.message : err);
@@ -98,7 +68,7 @@ export function createApp(makeTransport: (env: AppEnv) => Transport, deps: AppDe
 	// ---------- Público ----------
 
 	app.get("/", (c) => c.redirect("/setup"));
-	app.get("/health", (c) => c.json({ ok: true, version: VAULT_VERSION, protocol: PROTOCOL_VERSION }));
+	app.get("/health", (c) => c.json({ ok: true, version: VAULT_VERSION }));
 
 	const CSP =
 		"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'";
@@ -111,14 +81,9 @@ export function createApp(makeTransport: (env: AppEnv) => Transport, deps: AppDe
 
 	// ---------- Segredo configurado? ----------
 
-	const requireSecret: MiddlewareHandler<Ctx> = async (c, next) => {
+	const requireSecret = async (c: C, next: () => Promise<void>) => {
 		if (!secretIsStrong(c.env.VAULT_SECRET)) {
-			return fail(
-				c,
-				503,
-				"cofre_nao_configurado",
-				"VAULT_SECRET ausente ou curto demais (mínimo de 32 caracteres).",
-			);
+			return fail(c, 503, "cofre_nao_configurado", "VAULT_SECRET ausente ou curto demais (mínimo de 32 caracteres).");
 		}
 		await next();
 	};
@@ -138,18 +103,11 @@ export function createApp(makeTransport: (env: AppEnv) => Transport, deps: AppDe
 	});
 
 	app.get("/admin/status", async (c) => {
-		const [certificate, allowProduction, pairings] = await Promise.all([
+		const [certificate, allowProduction] = await Promise.all([
 			store.getCertificateInfo(c.env.DB),
 			store.getAllowProduction(c.env.DB),
-			store.listPairings(c.env.DB),
 		]);
-		return c.json({
-			version: VAULT_VERSION,
-			protocol: PROTOCOL_VERSION,
-			certificate,
-			allowProduction,
-			pairings,
-		});
+		return c.json({ version: VAULT_VERSION, certificate, allowProduction });
 	});
 
 	app.post("/admin/certificate", async (c) => {
@@ -184,131 +142,6 @@ export function createApp(makeTransport: (env: AppEnv) => Transport, deps: AppDe
 	app.delete("/admin/certificate", async (c) => {
 		await store.deleteCertificate(c.env.DB);
 		await store.audit(c.env.DB, { action: "certificado.remover", actor: "admin", outcome: "ok" });
-		return c.json({ ok: true });
-	});
-
-	app.post("/admin/pairings", async (c) => {
-		const input = parseJson<{ label?: unknown }>(await c.req.arrayBuffer());
-		const label = typeof input?.label === "string" ? input.label.trim().slice(0, 80) : "";
-		const pairing = await store.createPairing(c.env.DB, label || "API NFapi");
-		const key = await pairingKey(c.env.VAULT_SECRET, pairing.id);
-		const code = encodePairingCode({
-			v: 1,
-			url: new URL(c.req.url).origin,
-			id: pairing.id,
-			key: toHex(key),
-		});
-		await store.audit(c.env.DB, {
-			action: "pareamento.criar",
-			actor: "admin",
-			outcome: "ok",
-			detail: { pairing: pairing.id, label: pairing.label },
-		});
-		// O código só é exibido agora; depois não há como recuperá-lo.
-		return c.json({ pairing, code });
-	});
-
-	// Autoatendimento: cria a conta do emitente na API do NFapi e já deixa este
-	// cofre pareado. O cofre gera o pareamento, entrega o código à API e mostra
-	// ao emitente a chave de API devolvida (uma única vez).
-	app.post("/admin/register", async (c) => {
-		const input = parseJson<{ email?: unknown; apiUrl?: unknown }>(await c.req.arrayBuffer());
-		const email = typeof input?.email === "string" ? input.email.trim() : "";
-		if (email.length > 200 || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
-			return fail(c, 400, "requisicao_invalida", "Informe um e-mail válido.");
-		}
-		let api: URL;
-		try {
-			const informado = typeof input?.apiUrl === "string" ? input.apiUrl.trim() : "";
-			api = new URL(informado || DEFAULT_API_URL);
-		} catch {
-			return fail(c, 400, "requisicao_invalida", "Endereço da API inválido.");
-		}
-		if (api.protocol !== "https:" || api.username || api.password || !api.hostname.includes(".")) {
-			return fail(c, 400, "requisicao_invalida", "O endereço da API precisa ser https.");
-		}
-		if (!(await store.getCertificateInfo(c.env.DB))) {
-			return fail(c, 409, "certificado_ausente", "Instale o certificado antes de criar a conta.");
-		}
-
-		const pairing = await store.createPairing(c.env.DB, `Conta NFapi (${email})`.slice(0, 80));
-		const key = await pairingKey(c.env.VAULT_SECRET, pairing.id);
-		const code = encodePairingCode({
-			v: 1,
-			url: new URL(c.req.url).origin,
-			id: pairing.id,
-			key: toHex(key),
-		});
-
-		// Se o cadastro não der certo, o pareamento recém-criado não fica solto.
-		const desistir = async (status: Status, codigo: string, mensagem: string) => {
-			await store.revokePairing(c.env.DB, pairing.id);
-			await store.audit(c.env.DB, {
-				action: "cadastro",
-				actor: "admin",
-				outcome: codigo,
-				detail: { api: api.host },
-			});
-			return fail(c, status, codigo, mensagem);
-		};
-
-		let res: Response;
-		try {
-			res = await callApi(`${api.origin}/v1/cadastro`, {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ codigoPareamento: code, email }),
-			});
-		} catch (err) {
-			return desistir(
-				502,
-				"api_inacessivel",
-				`Não foi possível falar com a API: ${err instanceof Error ? err.message : String(err)}`,
-			);
-		}
-		const body = (await res.json().catch(() => null)) as {
-			erro?: { codigo?: string; mensagem?: string };
-			conta?: { id?: string; nome?: string; email?: string };
-			chave?: { chave?: string };
-			emitente?: { id?: string };
-		} | null;
-		if (!res.ok || !body?.chave?.chave) {
-			return desistir(
-				(STATUSES.includes(res.status) ? res.status : 502) as Status,
-				body?.erro?.codigo ?? "cadastro_recusado",
-				body?.erro?.mensagem ?? `A API respondeu HTTP ${res.status}.`,
-			);
-		}
-
-		// Guarda com qual API e por qual pareamento este cofre fala (usado pelo
-		// painel de notas para pedir cancelamentos).
-		await store.setSetting(c.env.DB, "api_url", api.origin);
-		await store.setSetting(c.env.DB, "api_pairing", pairing.id);
-		await store.audit(c.env.DB, {
-			action: "cadastro",
-			actor: "admin",
-			outcome: "ok",
-			// A chave de API nunca entra na auditoria.
-			detail: { api: api.host, conta: body.conta?.id ?? null, pairing: pairing.id },
-		});
-		return c.json({
-			api: api.origin,
-			conta: body.conta ?? null,
-			emitente: body.emitente?.id ?? null,
-			chave: body.chave.chave,
-		});
-	});
-
-	app.delete("/admin/pairings/:id", async (c) => {
-		const id = c.req.param("id");
-		const revoked = await store.revokePairing(c.env.DB, id);
-		if (!revoked) return fail(c, 404, "nao_encontrado", "Pareamento inexistente ou já revogado.");
-		await store.audit(c.env.DB, {
-			action: "pareamento.revogar",
-			actor: "admin",
-			outcome: "ok",
-			detail: { pairing: id },
-		});
 		return c.json({ ok: true });
 	});
 
@@ -359,73 +192,16 @@ export function createApp(makeTransport: (env: AppEnv) => Transport, deps: AppDe
 		});
 	});
 
-	// Cancelamento: o cofre pede à API, assinando com a chave do pareamento. A
-	// API monta o evento e volta a este cofre para assinar, transmitir e arquivar.
 	app.post("/admin/notas/cancelar", async (c) => {
-		const input = parseJson<{ chaveAcesso?: unknown; motivo?: unknown; justificativa?: unknown }>(
-			await c.req.arrayBuffer(),
-		);
-		if (typeof input?.chaveAcesso !== "string" || typeof input.motivo !== "string" || typeof input.justificativa !== "string") {
+		const input = parseJson<{ chaveAcesso?: unknown }>(await c.req.arrayBuffer());
+		if (typeof input?.chaveAcesso !== "string") {
 			return fail(c, 400, "requisicao_invalida", "Informe a chave de acesso, o motivo e a justificativa.");
 		}
-
-		// Notas emitidas por este cofre são canceladas aqui mesmo, sem passar por outro serviço.
-		const local = await cancelarPeloPainel(c, makeTransport(c.env), input.chaveAcesso, input);
-		if (local) return local;
-
-		// Notas antigas, emitidas pela API central: o pedido segue para ela.
-		const apiUrl = (await store.getSetting(c.env.DB, "api_url")) ?? DEFAULT_API_URL;
-		let pairingId = await store.getSetting(c.env.DB, "api_pairing");
-		if (!pairingId || !(await store.isPairingActive(c.env.DB, pairingId))) {
-			// Cofres conectados antes desta versão (ou pelo administrador): usa o pareamento ativo mais recente.
-			pairingId = (await store.listPairings(c.env.DB)).find((p) => !p.revokedAt)?.id ?? null;
-		}
-		if (!pairingId) {
-			return fail(c, 409, "sem_pareamento", "Este cofre não está conectado à API do NFapi.");
-		}
-
-		const path = "/cofre/nfse/cancelar";
-		const body = new TextEncoder().encode(
-			JSON.stringify({ chaveAcesso: input.chaveAcesso, motivo: input.motivo, justificativa: input.justificativa }),
+		const resposta = await cancelarPeloPainel(c, makeTransport(c.env), input.chaveAcesso, input);
+		return (
+			resposta ??
+			fail(c, 404, "nao_encontrado", "Esta nota não foi emitida por este cofre. Cancele-a pelo portal nacional.")
 		);
-		const assinatura = await signRequest({
-			key: await pairingKey(c.env.VAULT_SECRET, pairingId),
-			pairingId,
-			method: "POST",
-			path,
-			body,
-		});
-
-		let res: Response;
-		try {
-			res = await callApi(apiUrl + path, {
-				method: "POST",
-				headers: { ...assinatura, "content-type": "application/json" },
-				body,
-			});
-		} catch (err) {
-			return fail(c, 502, "api_inacessivel", `Não foi possível falar com a API: ${err instanceof Error ? err.message : String(err)}`);
-		}
-		const json = (await res.json().catch(() => null)) as {
-			erro?: { codigo?: string; mensagem?: string };
-			mensagens?: { codigo?: string; descricao?: string }[];
-		} | null;
-		await store.audit(c.env.DB, {
-			action: "nota.cancelar",
-			actor: "admin",
-			outcome: res.ok ? "ok" : (json?.erro?.codigo ?? `http_${res.status}`),
-			detail: { chaveAcesso: input.chaveAcesso, motivo: input.motivo },
-		});
-		if (!res.ok) {
-			const detalhes = (json?.mensagens ?? []).map((m) => `[${m.codigo}] ${m.descricao}`).join(" ");
-			return fail(
-				c,
-				(STATUSES.includes(res.status) ? res.status : 502) as Status,
-				json?.erro?.codigo ?? "cancelamento_recusado",
-				detalhes || json?.erro?.mensagem || `A API respondeu HTTP ${res.status}.`,
-			);
-		}
-		return c.json(json ?? { ok: true });
 	});
 
 	app.get("/admin/audit", async (c) => {
@@ -433,234 +209,7 @@ export function createApp(makeTransport: (env: AppEnv) => Transport, deps: AppDe
 		return c.json({ entries: await store.listAudit(c.env.DB, Number.isFinite(limit) ? limit : 50) });
 	});
 
-	// ---------- API central (HMAC) ----------
-
-	app.use("/v1/*", async (c, next) => {
-		// A API dos sistemas clientes (/v1/nfse) autentica por chave de API, em api-nfse.ts.
-		if (ehApiDeCliente(c.req.path)) return next();
-		const pairingId = c.req.header(HEADERS.pairing) ?? "";
-		const timestamp = c.req.header(HEADERS.timestamp) ?? "";
-		const nonce = c.req.header(HEADERS.nonce) ?? "";
-		const signature = c.req.header(HEADERS.signature) ?? "";
-		const denied = () => fail(c, 401, "nao_autenticado", "Assinatura da requisição ausente ou inválida.");
-
-		if (!/^[a-f0-9]{32}$/.test(pairingId) || !/^[A-Za-z0-9_-]{16,64}$/.test(nonce)) return denied();
-		const skew = Math.abs(Math.floor(Date.now() / 1000) - Number(timestamp));
-		if (!/^\d{9,11}$/.test(timestamp) || skew > MAX_CLOCK_SKEW_SECONDS) {
-			return fail(c, 401, "relogio_fora_de_sincronia", "Carimbo de tempo fora da janela aceita.");
-		}
-		if (Number(c.req.header("content-length") ?? 0) > MAX_BODY_BYTES) {
-			return fail(c, 413, "requisicao_grande_demais", "Corpo excede o limite do cofre.");
-		}
-		const body = await c.req.arrayBuffer();
-		if (body.byteLength > MAX_BODY_BYTES) {
-			return fail(c, 413, "requisicao_grande_demais", "Corpo excede o limite do cofre.");
-		}
-		if (!(await store.isPairingActive(c.env.DB, pairingId))) return denied();
-
-		const url = new URL(c.req.url);
-		const valid = await verifySignature(
-			await pairingKey(c.env.VAULT_SECRET, pairingId),
-			{
-				method: c.req.method,
-				path: url.pathname + url.search,
-				timestamp,
-				nonce,
-				bodySha256: await sha256Hex(body),
-			},
-			signature,
-		);
-		if (!valid) return denied();
-
-		// Só depois de autenticar: evita que terceiros encham a tabela de nonces.
-		const fresh = await store.consumeNonce(c.env.DB, `${pairingId}:${nonce}`, MAX_CLOCK_SKEW_SECONDS * 2);
-		if (!fresh) return fail(c, 401, "requisicao_repetida", "Esta requisição já foi processada.");
-
-		c.set("body", body);
-		c.set("actor", `pareamento:${pairingId}`);
-		await background(c, store.touchPairing(c.env.DB, pairingId));
-		if (Math.random() < 0.05) await background(c, store.purgeNonces(c.env.DB));
-		await next();
-	});
-
-	app.get("/v1/health", async (c) => {
-		const [certificate, allowProduction] = await Promise.all([
-			store.getCertificateInfo(c.env.DB),
-			store.getAllowProduction(c.env.DB),
-		]);
-		return c.json<HealthResponse>({
-			ok: true,
-			version: VAULT_VERSION,
-			protocol: PROTOCOL_VERSION,
-			certificate,
-			allowProduction,
-		});
-	});
-
-	/** Carrega o certificado ou responde por que não dá para usá-lo. */
-	async function usableCertificate(c: C) {
-		const cert = await store.loadCertificate(c.env.DB, c.env.VAULT_SECRET);
-		if (!cert) {
-			return { error: fail(c, 409, "certificado_ausente", "Nenhum certificado instalado no cofre.") };
-		}
-		if (Date.parse(cert.info.notAfter) < Date.now()) {
-			return { error: fail(c, 409, "certificado_vencido", "O certificado instalado venceu.") };
-		}
-		return { cert };
-	}
-
-	app.post("/v1/sign", async (c) => {
-		const input = parseJson<Partial<SignRequest>>(c.get("body"));
-		if (
-			!input ||
-			typeof input.xml !== "string" ||
-			typeof input.tag !== "string" ||
-			!SIGNABLE_TAGS.includes(input.tag) ||
-			(input.profile !== "rsa-sha1" && input.profile !== "rsa-sha256")
-		) {
-			return fail(c, 400, "requisicao_invalida", "Informe xml, tag e profile válidos.");
-		}
-		const { cert, error } = await usableCertificate(c);
-		if (!cert) return error;
-
-		try {
-			const out = signXml({
-				xml: input.xml,
-				tag: input.tag,
-				profile: input.profile,
-				privateKeyPem: cert.secrets.privateKeyPem,
-				certificatePem: cert.secrets.certificatePem,
-				holder: cert.holder,
-				allowProduction: await store.getAllowProduction(c.env.DB),
-			});
-			await store.audit(c.env.DB, {
-				action: "assinar",
-				actor: c.get("actor"),
-				outcome: "ok",
-				detail: { tag: input.tag, id: out.id, environment: out.environment },
-			});
-			return c.json<SignResponse>(out);
-		} catch (err) {
-			if (!(err instanceof SignError)) throw err;
-			await store.audit(c.env.DB, {
-				action: "assinar",
-				actor: c.get("actor"),
-				outcome: err.code,
-				detail: { tag: input.tag },
-			});
-			return fail(c, 422, err.code, err.message);
-		}
-	});
-
-	app.post("/v1/transmit", async (c) => {
-		const input = parseJson<Partial<TransmitRequest>>(c.get("body"));
-		if (!input || typeof input.url !== "string") {
-			return fail(c, 400, "requisicao_invalida", "Informe a url de destino.");
-		}
-		const request = input as TransmitRequest;
-		const actor = c.get("actor");
-		let host = "?";
-		try {
-			host = assertTransmittable(request).hostname;
-			const { cert, error } = await usableCertificate(c);
-			if (!cert) return error;
-
-			const result = await makeTransport(c.env).transmit(request, cert.secrets);
-			// O diário é gravado ANTES de responder: se a central cair agora, a
-			// resposta do governo (inclusive uma autorização) já está no R2 do emitente.
-			const journalKey = await store.writeJournal(c.env.DOCS, {
-				at: new Date().toISOString(),
-				actor,
-				ref: request.ref ?? null,
-				request: {
-					url: request.url,
-					method: request.method ?? "POST",
-					headers: request.headers ?? {},
-					bodyB64: request.bodyB64 ?? null,
-				},
-				response: result,
-			});
-			await store.audit(c.env.DB, {
-				action: "transmitir",
-				actor,
-				outcome: "ok",
-				detail: { host, status: result.status, ms: result.ms, journalKey, ref: request.ref ?? null },
-			});
-			return c.json<TransmitResponse>({ ...result, journalKey });
-		} catch (err) {
-			if (!(err instanceof TransportError)) throw err;
-			await store.audit(c.env.DB, {
-				action: "transmitir",
-				actor,
-				outcome: err.code,
-				detail: { host, ref: request.ref ?? null },
-			});
-			const status = (STATUSES.includes(err.status) ? err.status : 502) as Status;
-			return fail(c, status, err.code, err.message);
-		}
-	});
-
-	app.get("/v1/documents", async (c) => {
-		const before = Number(c.req.query("before"));
-		const limit = Number(c.req.query("limit"));
-		const documents = await store.listDocuments(c.env.DB, {
-			prefix: c.req.query("prefix"),
-			limit: Number.isFinite(limit) ? limit : undefined,
-			before: Number.isFinite(before) && before > 0 ? before : undefined,
-		});
-		return c.json({ documents });
-	});
-
-	const documentKey = (c: C) => {
-		try {
-			return decodeURIComponent(new URL(c.req.url).pathname.slice("/v1/documents/".length));
-		} catch {
-			return "";
-		}
-	};
-
-	app.put("/v1/documents/*", async (c) => {
-		const key = documentKey(c);
-		if (!store.isValidDocumentKey(key)) {
-			return fail(c, 400, "chave_invalida", "Chave de documento inválida.");
-		}
-		const body = c.get("body");
-		if (body.byteLength === 0) return fail(c, 400, "requisicao_invalida", "Documento vazio.");
-		let meta: Record<string, unknown> = {};
-		const rawMeta = c.req.header("x-nfapi-meta");
-		if (rawMeta) {
-			const parsed = rawMeta.length <= 4096 ? parseJson<Record<string, unknown>>(new TextEncoder().encode(rawMeta).buffer as ArrayBuffer) : undefined;
-			if (!parsed) return fail(c, 400, "requisicao_invalida", "x-nfapi-meta precisa ser JSON de até 4 KB.");
-			meta = parsed;
-		}
-		const entry = await store.putDocument(c.env.DB, c.env.DOCS, {
-			key,
-			body,
-			contentType: c.req.header("content-type") ?? "application/octet-stream",
-			meta,
-		});
-		await store.audit(c.env.DB, {
-			action: "documento.gravar",
-			actor: c.get("actor"),
-			outcome: "ok",
-			detail: { key, size: entry.size },
-		});
-		return c.json({ document: entry });
-	});
-
-	app.get("/v1/documents/*", async (c) => {
-		const key = documentKey(c);
-		if (!store.isValidDocumentKey(key)) {
-			return fail(c, 400, "chave_invalida", "Chave de documento inválida.");
-		}
-		const object = await store.getDocument(c.env.DOCS, key);
-		if (!object) return fail(c, 404, "nao_encontrado", "Documento inexistente.");
-		return c.body(object.body, 200, {
-			"content-type": object.httpMetadata?.contentType ?? "application/octet-stream",
-			"content-length": String(object.size),
-		});
-	});
-
+	registrarAtualizacao(app, callFetch);
 	registrarApiNfse(app, makeTransport);
 
 	return app;

@@ -1,7 +1,7 @@
 // Monta o XML da DPS (Declaração de Prestação de Serviços), que a SEFIN
 // Nacional converte em NFS-e.
 //
-// A ordem das tags segue os XSD oficiais em packages/fiscal-data/schemas/nfse.
+// A ordem das tags segue os XSD oficiais em schemas/nfse.
 // Há dois leiautes em vigor: o de produção ("1.01") e o da NT 009
 // ("1.01-nt009"), já exigido no ambiente de testes. As diferenças estão
 // marcadas com `nt009` abaixo e os testes validam os dois contra os XSD.

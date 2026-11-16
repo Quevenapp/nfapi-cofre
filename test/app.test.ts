@@ -1,19 +1,15 @@
 import { env } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app";
-import {
-	type PairingCode,
-	type TransmitRequest,
-	decodePairingCode,
-	fromHex,
-	signRequest,
-} from "../src/protocol";
+import { compararVersoes } from "../src/atualizacao";
+import { OperacaoError, abrirOperacoes } from "../src/operacoes";
+import { type TransmitRequest, VAULT_VERSION } from "../src/protocol";
 import type { CertificateSecrets } from "../src/store";
 import type { Transport, TransportResult } from "../src/transport";
 import { CNPJ_TESTE, SENHA_TESTE, pfxModerno } from "./helpers";
 
 const ORIGIN = "https://cofre.exemplo.workers.dev";
-const encoder = new TextEncoder();
+type Json = Record<string, any>;
 
 /** Transporte simulado: registra o que recebeu e devolve uma resposta fixa. */
 class FakeTransport implements Transport {
@@ -38,55 +34,23 @@ beforeEach(async () => {
 	app = createApp(() => transport);
 	// O D1 local persiste entre os testes do arquivo: cada caso começa do zero.
 	await env.DB.batch(
-		["certificate", "pairing", "nonces", "settings", "audit", "documents"].map((t) =>
+		["emissions", "series", "api_keys", "certificate", "settings", "audit", "documents"].map((t) =>
 			env.DB.prepare(`DELETE FROM ${t}`),
 		),
 	);
 });
 
-const admin = (path: string, init: RequestInit = {}) =>
-	app.request(
-		ORIGIN + path,
-		{ ...init, headers: { ...init.headers, authorization: `Bearer ${env.VAULT_SECRET}` } },
-		env,
-	);
+const comSegredo = (init: RequestInit = {}): RequestInit => ({
+	...init,
+	headers: { ...init.headers, authorization: `Bearer ${env.VAULT_SECRET}` },
+});
+const admin = (path: string, init: RequestInit = {}) => app.request(ORIGIN + path, comSegredo(init), env);
 
 async function instalarCertificado(senha = SENHA_TESTE) {
 	const form = new FormData();
 	form.append("pfx", new File([pfxModerno()], "a1.pfx"));
 	form.append("password", senha);
 	return admin("/admin/certificate", { method: "POST", body: form });
-}
-
-async function parear(): Promise<PairingCode> {
-	const res = await admin("/admin/pairings", {
-		method: "POST",
-		body: JSON.stringify({ label: "teste" }),
-	});
-	const { code } = (await res.json()) as { code: string };
-	return decodePairingCode(code);
-}
-
-async function central(
-	pairing: PairingCode,
-	method: string,
-	path: string,
-	body: string | Uint8Array<ArrayBuffer> = "",
-	extra: { headers?: Record<string, string>; now?: number; tamper?: boolean } = {},
-) {
-	const bytes = typeof body === "string" ? encoder.encode(body) : body;
-	const auth = await signRequest({
-		key: fromHex(pairing.key),
-		pairingId: pairing.id,
-		method,
-		path,
-		body: bytes,
-		now: extra.now,
-	});
-	const sent = extra.tamper ? encoder.encode(`${new TextDecoder().decode(bytes)} `) : bytes;
-	const init: RequestInit = { method, headers: { ...auth, ...extra.headers } };
-	if (method !== "GET" && method !== "HEAD") init.body = sent;
-	return { res: await app.request(ORIGIN + path, init, env), auth };
 }
 
 const erro = async (res: Response) => ((await res.json()) as { error: { code: string } }).error.code;
@@ -98,16 +62,22 @@ const NFE = (tpAmb: 1 | 2, cnpj = CNPJ_TESTE) =>
 describe("acesso", () => {
 	it("expõe só o mínimo sem autenticação", async () => {
 		const health = await app.request(`${ORIGIN}/health`, {}, env);
-		expect(await health.json()).toEqual({ ok: true, version: "0.1.0", protocol: 1 });
+		expect(await health.json()).toEqual({ ok: true, version: VAULT_VERSION });
+		expect(VAULT_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
 
 		const setup = await app.request(`${ORIGIN}/setup`, {}, env);
 		expect(setup.status).toBe(200);
 		expect(setup.headers.get("content-security-policy")).toContain("script-src 'self'");
-		expect(await setup.text()).toContain("Cofre NFapi");
+		const html = await setup.text();
+		expect(html).toContain("Cofre NFapi");
+		expect(html).toContain("Atualização");
+		expect((await app.request(`${ORIGIN}/setup/app.js`, {}, env)).headers.get("content-type")).toContain("javascript");
 	});
 
 	it("exige o segredo do cofre nas rotas de administração", async () => {
-		expect((await app.request(`${ORIGIN}/admin/status`, {}, env)).status).toBe(401);
+		for (const rota of ["/admin/status", "/admin/notas", "/admin/chaves", "/admin/atualizacao", "/admin/audit"]) {
+			expect((await app.request(ORIGIN + rota, {}, env)).status).toBe(401);
+		}
 		const errado = await app.request(
 			`${ORIGIN}/admin/status`,
 			{ headers: { authorization: "Bearer segredo-errado" } },
@@ -118,13 +88,29 @@ describe("acesso", () => {
 	});
 
 	it("recusa operar com VAULT_SECRET fraco", async () => {
-		const res = await app.request(
-			`${ORIGIN}/admin/status`,
-			{ headers: { authorization: "Bearer curto" } },
-			{ ...env, VAULT_SECRET: "curto" },
-		);
-		expect(res.status).toBe(503);
-		expect(await erro(res)).toBe("cofre_nao_configurado");
+		const fraco = { ...env, VAULT_SECRET: "curto" };
+		const init = { headers: { authorization: "Bearer curto" } };
+		for (const rota of ["/admin/status", "/v1/nfse"]) {
+			const res = await app.request(ORIGIN + rota, init, fraco);
+			expect(res.status).toBe(503);
+			expect(await erro(res)).toBe("cofre_nao_configurado");
+		}
+	});
+
+	it("não tem mais as rotas da integração com a API central", async () => {
+		await instalarCertificado();
+		for (const [method, rota] of [
+			["GET", "/v1/health"],
+			["POST", "/v1/sign"],
+			["POST", "/v1/transmit"],
+			["PUT", "/v1/documents/nfe/x.xml"],
+			["POST", "/admin/pairings"],
+			["POST", "/admin/register"],
+		] as const) {
+			expect((await admin(rota, { method })).status).toBe(404);
+		}
+		const status = (await (await admin("/admin/status")).json()) as Json;
+		expect(Object.keys(status).sort()).toEqual(["allowProduction", "certificate", "version"]);
 	});
 });
 
@@ -152,84 +138,50 @@ describe("certificado", () => {
 	});
 });
 
-describe("autenticação da API central", () => {
-	it("aceita requisição assinada e recusa repetição, adulteração, relógio e revogação", async () => {
-		const pairing = await parear();
-		expect(pairing.url).toBe(ORIGIN);
+describe("travas das operações do cofre", () => {
+	const abrir = () => abrirOperacoes(env, transport, "teste");
+	const codigo = (promessa: Promise<unknown>) =>
+		promessa.then(
+			() => "sem erro",
+			(err) => (err instanceof OperacaoError ? err.code : `inesperado: ${err}`),
+		);
 
-		const ok = await central(pairing, "GET", "/v1/health");
-		expect(ok.res.status).toBe(200);
-
-		// Mesmos cabeçalhos de novo: repetição.
-		const replay = await app.request(`${ORIGIN}/v1/health`, { headers: ok.auth }, env);
-		expect(await erro(replay)).toBe("requisicao_repetida");
-
-		const adulterada = await central(pairing, "POST", "/v1/sign", "{}", { tamper: true });
-		expect(adulterada.res.status).toBe(401);
-
-		const antiga = await central(pairing, "GET", "/v1/health", "", { now: Date.now() - 3_600_000 });
-		expect(await erro(antiga.res)).toBe("relogio_fora_de_sincronia");
-
-		const chaveErrada = await central({ ...pairing, key: "00".repeat(32) }, "GET", "/v1/health");
-		expect(chaveErrada.res.status).toBe(401);
-
-		expect((await app.request(`${ORIGIN}/v1/health`, {}, env)).status).toBe(401);
-
-		await admin(`/admin/pairings/${pairing.id}`, { method: "DELETE" });
-		expect((await central(pairing, "GET", "/v1/health")).res.status).toBe(401);
+	it("sem certificado não há operação", async () => {
+		expect(await codigo(abrir())).toBe("certificado_ausente");
 	});
-});
-
-describe("assinar", () => {
-	const assinar = (pairing: PairingCode, xml: string) =>
-		central(pairing, "POST", "/v1/sign", JSON.stringify({ xml, tag: "infNFe", profile: "rsa-sha1" }));
 
 	it("assina homologação e mantém produção bloqueada até o emitente liberar", async () => {
 		await instalarCertificado();
-		const pairing = await parear();
+		const assinar = async (xml: string) => (await abrir()).sign({ xml, tag: "infNFe", profile: "rsa-sha1" });
 
-		const hom = await assinar(pairing, NFE(2));
-		expect(hom.res.status).toBe(200);
-		const out = (await hom.res.json()) as { xml: string; environment: string };
-		expect(out.environment).toBe("homologacao");
-		expect(out.xml).toContain("<SignatureValue>");
+		const hom = await assinar(NFE(2));
+		expect(hom.environment).toBe("homologacao");
+		expect(hom.xml).toContain("<SignatureValue>");
 
-		const prod = await assinar(pairing, NFE(1));
-		expect(prod.res.status).toBe(422);
-		expect(await erro(prod.res)).toBe("producao_bloqueada");
-
+		expect(await codigo(assinar(NFE(1)))).toBe("producao_bloqueada");
 		await admin("/admin/settings", { method: "PUT", body: JSON.stringify({ allowProduction: true }) });
-		expect((await assinar(pairing, NFE(1))).res.status).toBe(200);
+		expect((await assinar(NFE(1))).environment).toBe("producao");
 	});
 
-	it("recusa documento de outro emitente e pedido sem certificado", async () => {
-		const pairing = await parear();
-		const semCert = await assinar(pairing, NFE(2));
-		expect(await erro(semCert.res)).toBe("certificado_ausente");
-
+	it("recusa assinar documento de outro emitente", async () => {
 		await instalarCertificado();
-		const outro = await assinar(pairing, NFE(2, "99888777000166"));
-		expect(await erro(outro.res)).toBe("emitente_divergente");
+		const ops = await abrir();
+		expect(await codigo(ops.sign({ xml: NFE(2, "99888777000166"), tag: "infNFe", profile: "rsa-sha1" }))).toBe(
+			"emitente_divergente",
+		);
 	});
-});
 
-describe("transmitir", () => {
-	const transmitir = (pairing: PairingCode, url: string) =>
-		central(pairing, "POST", "/v1/transmit", JSON.stringify({ url, bodyB64: btoa("<envelope/>"), ref: "emissao-1" }));
-
-	it("só transmite para o governo e grava o diário antes de responder", async () => {
+	it("só transmite para o governo e grava o diário antes de seguir", async () => {
 		await instalarCertificado();
-		const pairing = await parear();
+		const ops = await abrir();
+		const transmitir = (url: string) => ops.transmit({ url, bodyB64: btoa("<envelope/>"), ref: "emissao-1" });
 
 		for (const url of ["https://evil.example.com/x", "https://gov.br.evil.com/x", "http://nfe.svrs.rs.gov.br/x"]) {
-			const fora = await transmitir(pairing, url);
-			expect(fora.res.status).toBeGreaterThanOrEqual(400);
+			expect(await codigo(transmitir(url))).toMatch(/^(host_nao_permitido|requisicao_invalida)$/);
 		}
 		expect(transport.calls).toHaveLength(0);
 
-		const { res } = await transmitir(pairing, "https://nfe-homologacao.svrs.rs.gov.br/ws/NFeAutorizacao4");
-		expect(res.status).toBe(200);
-		const out = (await res.json()) as { status: number; journalKey: string };
+		const out = await transmitir("https://nfe-homologacao.svrs.rs.gov.br/ws/NFeAutorizacao4");
 		expect(out.status).toBe(200);
 
 		// O Container recebeu o certificado decifrado...
@@ -244,110 +196,135 @@ describe("transmitir", () => {
 	});
 });
 
-describe("documentos", () => {
-	it("grava, lê e lista; recusa chaves que escapam da área de documentos", async () => {
-		const pairing = await parear();
-		const xml = "<nfeProc>autorizada</nfeProc>";
-		const key = "nfe/2026/11/35261111222333000181550010000000011000000015-procNFe.xml";
+describe("arquivos das notas", () => {
+	it("baixa só arquivos de notas; o diário e caminhos fora da área ficam inacessíveis", async () => {
+		await instalarCertificado();
+		const ops = await abrirOperacoes(env, transport, "teste");
+		const key = "nfse/homologacao/2026/11/nota-NFSe.xml";
+		await ops.putDocument(key, "<NFSe>autorizada</NFSe>", { contentType: "application/xml", meta: {} });
 
-		const put = await central(pairing, "PUT", `/v1/documents/${key}`, xml, {
-			headers: { "content-type": "application/xml", "x-nfapi-meta": JSON.stringify({ modelo: 55 }) },
-		});
-		expect(put.res.status).toBe(200);
+		const ok = await admin(`/admin/notas/arquivo?key=${encodeURIComponent(key)}`);
+		expect(ok.status).toBe(200);
+		expect(ok.headers.get("content-disposition")).toBe('attachment; filename="nota-NFSe.xml"');
+		expect(await ok.text()).toBe("<NFSe>autorizada</NFSe>");
 
-		const get = await central(pairing, "GET", `/v1/documents/${key}`);
-		expect(get.res.headers.get("content-type")).toBe("application/xml");
-		expect(await get.res.text()).toBe(xml);
-
-		const list = await central(pairing, "GET", "/v1/documents?prefix=nfe/2026/");
-		const { documents } = (await list.res.json()) as { documents: { key: string; meta: unknown }[] };
-		expect(documents).toHaveLength(1);
-		expect(documents[0]?.meta).toEqual({ modelo: 55 });
-
-		for (const ruim of ["journal/2026/x.json", "nfe/..%2F..%2Fsegredo", "%2Fabsoluto"]) {
-			const res = await central(pairing, "PUT", `/v1/documents/${ruim}`, "x");
-			expect(await erro(res.res)).toBe("chave_invalida");
+		for (const ruim of ["journal/2026/11/16/x.json", "nfse/../journal/x.json", "/nfse/x.xml", "outra/coisa.xml", ""]) {
+			expect((await admin(`/admin/notas/arquivo?key=${encodeURIComponent(ruim)}`)).status).toBe(400);
 		}
-		expect((await central(pairing, "GET", "/v1/documents/nao/existe.xml")).res.status).toBe(404);
+		expect((await admin("/admin/notas/arquivo?key=nfse/nao/existe.xml")).status).toBe(404);
 	});
 });
 
-describe("cadastro na API (Criar minha conta)", () => {
-	type Chamada = { url: string; body: { codigoPareamento: string; email: string } };
+describe("atualização pelo botão", () => {
+	const GATILHO = "https://api.cloudflare.com/client/v4/workers/builds/deploy_hooks/abcdef0123456789abcdef0123456789";
+	type Chamada = { url: string; method: string };
 
-	/** Cofre ligado a uma API simulada que responde o que o teste mandar. */
-	function comApi(resposta: () => Response) {
+	/** Cofre com as chamadas de saída (GitHub e Cloudflare) simuladas. */
+	function comRede(publicada: string | null, gatilho: () => Response = () => Response.json({ success: true })) {
 		const chamadas: Chamada[] = [];
 		const cofre = createApp(() => transport, {
 			fetch: async (input, init) => {
-				chamadas.push({ url: String(input), body: JSON.parse(String(init?.body)) as Chamada["body"] });
-				return resposta();
+				const url = String(input);
+				chamadas.push({ url, method: init?.method ?? "GET" });
+				if (url.startsWith("https://raw.githubusercontent.com/")) {
+					return publicada ? Response.json({ name: "nfapi-cofre", version: publicada }) : new Response("", { status: 500 });
+				}
+				return gatilho();
 			},
 		});
-		const registrar = (body: unknown) =>
-			cofre.request(
-				`${ORIGIN}/admin/register`,
-				{ method: "POST", body: JSON.stringify(body), headers: { authorization: `Bearer ${env.VAULT_SECRET}` } },
-				env,
-			);
-		return { chamadas, registrar };
+		const pedir = (method: string, path: string, body?: unknown) =>
+			cofre.request(ORIGIN + path, comSegredo({ method, body: body === undefined ? undefined : JSON.stringify(body) }), env);
+		return { chamadas, pedir };
 	}
-	const ativos = async () =>
-		(await env.DB.prepare("SELECT COUNT(*) AS n FROM pairing WHERE revoked_at IS NULL").first<{ n: number }>())?.n;
 
-	it("entrega o código de pareamento à API e devolve a chave ao emitente", async () => {
-		await instalarCertificado();
-		const { chamadas, registrar } = comApi(() =>
-			Response.json({ conta: { id: "cta_1", nome: "Empresa" }, chave: { chave: "nfapi_chave-de-teste" }, emitente: { id: "emi_1" } }, { status: 201 }),
-		);
-		const res = await registrar({ email: "dono@exemplo.test" });
-		expect(res.status).toBe(200);
-		expect(await res.json()).toMatchObject({ api: "https://api.nfapi.queven.app", chave: "nfapi_chave-de-teste" });
-
-		// Sem endereço informado, usa a API padrão; o código aponta para este cofre.
-		expect(chamadas).toHaveLength(1);
-		expect(chamadas[0]?.url).toBe("https://api.nfapi.queven.app/v1/cadastro");
-		expect(chamadas[0]?.body.email).toBe("dono@exemplo.test");
-		expect(decodePairingCode(chamadas[0]?.body.codigoPareamento ?? "").url).toBe(ORIGIN);
-		expect(await ativos()).toBe(1);
-
-		const auditoria = await env.DB.prepare("SELECT detail FROM audit WHERE action = 'cadastro'").first<{ detail: string }>();
-		expect(auditoria?.detail).not.toContain("nfapi_chave-de-teste");
+	it("compara as versões por número", () => {
+		expect(compararVersoes("0.10.0", "0.9.9")).toBeGreaterThan(0);
+		expect(compararVersoes("1.0.0", "1.0.0")).toBe(0);
+		expect(compararVersoes("0.2.0", "0.2.1")).toBeLessThan(0);
 	});
 
-	it("se a API recusar, repassa o motivo e revoga o pareamento criado", async () => {
-		await instalarCertificado();
-		const { registrar } = comApi(() =>
-			Response.json({ erro: { codigo: "email_ja_cadastrado", mensagem: "Já existe uma conta com este e-mail." } }, { status: 409 }),
-		);
-		const res = await registrar({ email: "dono@exemplo.test" });
-		expect(res.status).toBe(409);
-		expect(await erro(res)).toBe("email_ja_cadastrado");
-		expect(await ativos()).toBe(0);
+	it("mostra a versão publicada no canal estável e avisa quando há uma mais nova", async () => {
+		const nova = comRede("99.0.0");
+		const estado = (await (await nova.pedir("GET", "/admin/atualizacao")).json()) as Json;
+		expect(estado).toEqual({
+			instalada: VAULT_VERSION,
+			publicada: "99.0.0",
+			haAtualizacao: true,
+			gatilhoConfigurado: false,
+			canal: "Quevenapp/nfapi@cofre-estavel",
+		});
+		expect(nova.chamadas).toEqual([
+			{ url: "https://raw.githubusercontent.com/Quevenapp/nfapi/cofre-estavel/vault/package.json", method: "GET" },
+		]);
+
+		// A consulta fica em cache; "verificar novamente" força uma nova leitura.
+		await nova.pedir("GET", "/admin/atualizacao");
+		expect(nova.chamadas).toHaveLength(1);
+		await nova.pedir("GET", "/admin/atualizacao?verificar=1");
+		expect(nova.chamadas).toHaveLength(2);
 	});
 
-	it("não chama a API sem certificado, com e-mail inválido ou com endereço inseguro", async () => {
-		const { chamadas, registrar } = comApi(() => Response.json({}, { status: 500 }));
-		expect(await erro(await registrar({ email: "dono@exemplo.test" }))).toBe("certificado_ausente");
+	it("não acusa atualização quando está em dia ou quando o GitHub não responde", async () => {
+		const emDia = (await (await comRede(VAULT_VERSION).pedir("GET", "/admin/atualizacao?verificar=1")).json()) as Json;
+		expect(emDia).toMatchObject({ publicada: VAULT_VERSION, haAtualizacao: false });
 
-		await instalarCertificado();
-		expect((await registrar({ email: "sem-arroba" })).status).toBe(400);
-		expect((await registrar({ email: "dono@exemplo.test", apiUrl: "http://api.exemplo.test" })).status).toBe(400);
-		expect((await registrar({ email: "dono@exemplo.test", apiUrl: "nao é url" })).status).toBe(400);
+		await env.DB.prepare("DELETE FROM settings").run();
+		const semRede = (await (await comRede(null).pedir("GET", "/admin/atualizacao")).json()) as Json;
+		expect(semRede).toMatchObject({ publicada: null, haAtualizacao: false });
+	});
+
+	it("guarda o gatilho cifrado e dispara o build do Cloudflare", async () => {
+		const { chamadas, pedir } = comRede("99.0.0");
+		const semGatilho = await pedir("POST", "/admin/atualizacao");
+		expect(semGatilho.status).toBe(409);
+		expect(await erro(semGatilho)).toBe("gatilho_ausente");
+
+		for (const url of [
+			"https://evil.example.com/client/v4/workers/builds/deploy_hooks/abcdef0123456789",
+			"http://api.cloudflare.com/client/v4/workers/builds/deploy_hooks/abcdef0123456789",
+			`${GATILHO}/../../../accounts`,
+			`${GATILHO}?x=1`,
+			"",
+		]) {
+			expect(await erro(await pedir("PUT", "/admin/atualizacao/gatilho", { url }))).toBe("gatilho_invalido");
+		}
 		expect(chamadas).toHaveLength(0);
-		expect(await ativos()).toBe(0);
+
+		expect((await pedir("PUT", "/admin/atualizacao/gatilho", { url: GATILHO })).status).toBe(200);
+		const guardado = await env.DB.prepare("SELECT value FROM settings WHERE key = 'gatilho_de_build'").first<{ value: string }>();
+		expect(guardado?.value).not.toContain("deploy_hooks");
+		expect(((await (await pedir("GET", "/admin/atualizacao")).json()) as Json).gatilhoConfigurado).toBe(true);
+
+		const disparo = await pedir("POST", "/admin/atualizacao");
+		expect(disparo.status).toBe(200);
+		expect(chamadas.at(-1)).toEqual({ url: GATILHO, method: "POST" });
+
+		// A URL do gatilho é uma credencial: não aparece na auditoria nem nas respostas.
+		const auditoria = await (await pedir("GET", "/admin/audit")).text();
+		expect(auditoria).toContain("atualizacao.disparar");
+		expect(auditoria).not.toContain("deploy_hooks");
+	});
+
+	it("avisa quando o Cloudflare recusa o gatilho", async () => {
+		const { pedir } = comRede("99.0.0", () => new Response("not found", { status: 404 }));
+		await pedir("PUT", "/admin/atualizacao/gatilho", { url: GATILHO });
+		const res = await pedir("POST", "/admin/atualizacao");
+		expect(res.status).toBe(502);
+		expect(await erro(res)).toBe("gatilho_recusado");
 	});
 });
 
 describe("auditoria", () => {
 	it("registra as operações sem guardar conteúdo de documento", async () => {
 		await instalarCertificado();
-		const pairing = await parear();
-		await central(pairing, "POST", "/v1/sign", JSON.stringify({ xml: NFE(2), tag: "infNFe", profile: "rsa-sha1" }));
+		const ops = await abrirOperacoes(env, transport, "chave:chv_teste");
+		await ops.sign({ xml: NFE(2), tag: "infNFe", profile: "rsa-sha1" });
+		await admin("/admin/selftest", { method: "POST" });
 
 		const res = await admin("/admin/audit");
-		const { entries } = (await res.json()) as { entries: { action: string; outcome: string }[] };
-		expect(entries.map((e) => e.action)).toEqual(["assinar", "pareamento.criar", "certificado.instalar"]);
+		const { entries } = (await res.json()) as { entries: { action: string; actor: string }[] };
+		expect(entries.map((e) => e.action)).toEqual(["autoteste", "assinar", "certificado.instalar"]);
+		expect(entries[1]?.actor).toBe("chave:chv_teste");
 		expect(JSON.stringify(entries)).not.toContain("<infNFe");
 	});
 });

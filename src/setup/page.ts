@@ -1,4 +1,4 @@
-// Tela de configuração do cofre, servida em /setup.
+// Tela de configuração do cofre, servida em /setup. É o painel do emitente.
 //
 // HTML, CSS e JS são arquivos separados (rotas próprias) para permitir uma CSP
 // sem 'unsafe-inline'. O JS não usa innerHTML: todo texto vindo do servidor
@@ -17,7 +17,7 @@ export const SETUP_HTML = String.raw`<!doctype html>
 <main>
 	<header>
 		<h1>Cofre NFapi</h1>
-		<p class="muted">Seu certificado digital e seus documentos fiscais ficam aqui, na sua conta Cloudflare.</p>
+		<p class="muted">Seu emissor de notas fiscais: o certificado digital e os documentos ficam aqui, na sua conta Cloudflare.</p>
 	</header>
 
 	<section id="login" class="card">
@@ -78,38 +78,6 @@ export const SETUP_HTML = String.raw`<!doctype html>
 		</section>
 
 		<section class="card">
-			<h2>Conta na API central (opcional)</h2>
-			<p class="muted small">Recurso da versão anterior, em que a emissão passava por uma API central. Não é necessário para emitir por este cofre.</p>
-			<form id="register-form">
-				<label for="reg-email">Seu e-mail</label>
-				<input id="reg-email" type="email" maxlength="200" autocomplete="email" required>
-				<label for="reg-api">Endereço da API</label>
-				<input id="reg-api" type="url" value="https://api.nfapi.queven.app" required>
-				<button type="submit">Criar minha conta</button>
-			</form>
-			<p id="reg-message" role="status"></p>
-			<div id="reg-key-box" hidden>
-				<p class="warn">Copie agora: a chave de API aparece uma única vez.</p>
-				<textarea id="reg-key" readonly rows="2"></textarea>
-				<button type="button" id="reg-copy" class="ghost">Copiar chave de API</button>
-			</div>
-
-			<h3>Já tem conta?</h3>
-			<p class="muted small">Gere um código de pareamento e envie-o à API (<code>POST /v1/emitentes</code>) ou ao administrador. Ele autoriza a API a pedir assinaturas e transmissões a este cofre.</p>
-			<form id="pair-form">
-				<label for="pair-label">Nome desta conexão</label>
-				<input id="pair-label" type="text" maxlength="80" placeholder="API NFapi">
-				<button type="submit">Gerar código de pareamento</button>
-			</form>
-			<div id="pair-code-box" hidden>
-				<p class="warn">Copie agora: o código aparece uma única vez.</p>
-				<textarea id="pair-code" readonly rows="4"></textarea>
-				<button type="button" id="pair-copy" class="ghost">Copiar código</button>
-			</div>
-			<ul id="pairings" class="results"></ul>
-		</section>
-
-		<section class="card">
 			<h2>4. Ambiente</h2>
 			<p id="env-status"></p>
 			<button type="button" id="env-toggle" class="ghost"></button>
@@ -118,10 +86,35 @@ export const SETUP_HTML = String.raw`<!doctype html>
 
 		<section class="card">
 			<h2>Notas emitidas</h2>
-			<p class="muted small">Os arquivos ficam neste cofre. O cancelamento é pedido à API do NFapi e registrado na SEFIN; o município define o prazo em que ele é aceito.</p>
+			<p class="muted small">Os arquivos ficam neste cofre. O cancelamento é registrado na SEFIN; o município define o prazo em que ele é aceito.</p>
 			<p id="notes-empty" class="muted" hidden>Nenhuma nota arquivada neste cofre ainda.</p>
 			<ul id="notes" class="notes"></ul>
 			<p id="notes-message" role="status"></p>
+		</section>
+
+		<section class="card">
+			<h2>Atualização</h2>
+			<p id="update-status"></p>
+			<div class="row">
+				<button type="button" id="update-run" hidden>Atualizar agora</button>
+				<button type="button" id="update-check" class="ghost">Verificar novamente</button>
+			</div>
+			<p id="update-message" role="status"></p>
+			<details id="update-setup">
+				<summary>Configurar o gatilho de atualização</summary>
+				<p class="small">A atualização dispara um novo build deste cofre no Cloudflare. Crie o gatilho uma única vez:</p>
+				<ol class="small">
+					<li>No painel do Cloudflare, abra <strong>Workers &amp; Pages</strong> e selecione este Worker.</li>
+					<li>Em <strong>Settings &gt; Builds &gt; Deploy Hooks</strong>, crie um gatilho para a branch <code>main</code>.</li>
+					<li>Copie a URL gerada e cole abaixo.</li>
+				</ol>
+				<form id="hook-form">
+					<label for="hook-url">URL do Deploy Hook</label>
+					<input id="hook-url" type="password" autocomplete="off" placeholder="https://api.cloudflare.com/client/v4/workers/builds/deploy_hooks/..." required>
+					<button type="submit" class="ghost">Salvar gatilho</button>
+				</form>
+				<p class="muted small">Quem tem essa URL consegue disparar builds, então ela fica guardada cifrada neste cofre.</p>
+			</details>
 		</section>
 
 		<section class="card">
@@ -159,7 +152,8 @@ header { margin-bottom: 20px; }
 h1 { font-size: 1.6rem; margin: 0 0 4px; }
 h2 { font-size: 1.1rem; margin: 0 0 12px; }
 p { margin: 0 0 12px; }
-code { font-family: ui-monospace, Consolas, monospace; font-size: 0.9em; }
+ol { margin: 0 0 12px; padding-left: 20px; }
+code { font-family: ui-monospace, Consolas, monospace; font-size: 0.9em; overflow-wrap: anywhere; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 20px; margin-bottom: 16px; }
 .muted { color: var(--muted); }
 .small { font-size: 0.875rem; }
@@ -167,8 +161,7 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 0.9em; }
 .ok { color: var(--ok); }
 .warn { color: var(--warn); font-weight: 600; }
 label { display: block; font-weight: 600; font-size: 0.9rem; margin: 12px 0 4px; }
-h3 { font-size: 0.95rem; margin: 22px 0 6px; }
-input[type="text"], input[type="password"], input[type="email"], input[type="url"], input[type="file"], textarea {
+input[type="text"], input[type="password"], input[type="file"], textarea, select {
 	width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px;
 	background: var(--bg); color: var(--text); font: inherit;
 }
@@ -180,7 +173,7 @@ button {
 button.ghost { background: transparent; color: var(--accent); }
 button.danger { border-color: var(--bad); color: var(--bad); }
 button:disabled { opacity: 0.6; cursor: progress; }
-button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
 .row { display: flex; gap: 10px; flex-wrap: wrap; }
 dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 0 0 12px; }
 dt { color: var(--muted); }
@@ -188,16 +181,16 @@ dd { margin: 0; overflow-wrap: anywhere; }
 .results { list-style: none; margin: 14px 0 0; padding: 0; }
 .results li { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 0; border-top: 1px solid var(--line); flex-wrap: wrap; }
 .results li button { margin-top: 0; padding: 6px 12px; }
-.results .detail { display: block; color: var(--muted); font-size: 0.875rem; overflow-wrap: anywhere; }
+.results .detail, .notes .detail { display: block; color: var(--muted); font-size: 0.875rem; overflow-wrap: anywhere; }
 .notes { list-style: none; margin: 0; padding: 0; }
 .notes > li { padding: 14px 0; border-top: 1px solid var(--line); }
 .notes .head { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-weight: 600; }
-.notes .detail { display: block; color: var(--muted); font-size: 0.875rem; overflow-wrap: anywhere; }
 .notes .acts { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
 .notes .acts button { margin-top: 0; padding: 6px 12px; font-size: 0.9rem; }
 .notes .cancel-form { margin-top: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; }
 .badge { display: inline-block; padding: 1px 10px; border-radius: 999px; border: 1px solid currentColor; font-size: 0.8rem; font-weight: 700; white-space: nowrap; }
-select { width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; }
+details { margin-top: 14px; }
+summary { cursor: pointer; color: var(--accent); font-weight: 600; }
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
 th, td { text-align: left; padding: 6px 10px 6px 0; border-top: 1px solid var(--line); white-space: nowrap; }
@@ -235,16 +228,15 @@ export const SETUP_JS = String.raw`(function () {
 		var json = await res.json().catch(function () { return null; });
 		if (!res.ok) {
 			var detalhe = json && ((json.error && json.error.message) || (json.erro && json.erro.mensagem));
-			var err = new Error(detalhe || ("Erro HTTP " + res.status));
-			err.status = res.status;
-			throw err;
+			throw new Error(detalhe || ("Erro HTTP " + res.status));
 		}
 		return json;
 	}
 
 	async function busy(button, task) {
-		button.disabled = true;
-		try { return await task(); } finally { button.disabled = false; }
+		// Formulário enviado pelo teclado pode não informar o botão.
+		if (button) button.disabled = true;
+		try { return await task(); } finally { if (button) button.disabled = false; }
 	}
 
 	function message(id, text, kind) {
@@ -252,6 +244,18 @@ export const SETUP_JS = String.raw`(function () {
 		node.textContent = text;
 		node.className = kind || "";
 	}
+
+	async function copiar(campo, botao, feito) {
+		campo.select();
+		try {
+			await navigator.clipboard.writeText(campo.value);
+			botao.textContent = feito;
+		} catch (e) {
+			document.execCommand("copy");
+		}
+	}
+
+	// ---------- Certificado ----------
 
 	function renderCertificate() {
 		var box = $("cert-status");
@@ -282,52 +286,10 @@ export const SETUP_JS = String.raw`(function () {
 	function renderEnvironment() {
 		var on = state.allowProduction;
 		$("env-status").textContent = on
-			? "Produção LIBERADA: este cofre assina documentos com valor fiscal."
-			: "Produção bloqueada: este cofre só assina documentos de homologação.";
+			? "Produção LIBERADA: este cofre emite documentos com valor fiscal."
+			: "Produção bloqueada: este cofre só emite documentos de homologação.";
 		$("env-status").className = on ? "warn" : "ok";
 		$("env-toggle").textContent = on ? "Bloquear produção" : "Liberar produção";
-	}
-
-	function renderPairings() {
-		var list = $("pairings");
-		clear(list);
-		state.pairings.forEach(function (p) {
-			var info = el("span", {}, [
-				el("strong", { text: p.label }),
-				el("span", {
-					class: "detail",
-					text: p.revokedAt
-						? "Revogado em " + date(p.revokedAt)
-						: "Criado em " + date(p.createdAt) + (p.lastUsedAt ? " · último uso " + date(p.lastUsedAt) : " · nunca usado")
-				})
-			]);
-			var item = el("li", {}, [info]);
-			if (!p.revokedAt) {
-				item.appendChild(el("button", {
-					type: "button", class: "ghost danger", text: "Revogar",
-					onclick: async function (ev) {
-						if (!confirm("Revogar a conexão \"" + p.label + "\"? A API deixará de conseguir usar este cofre.")) return;
-						await busy(ev.currentTarget, function () { return api("DELETE", "/admin/pairings/" + p.id); });
-						await refresh();
-					}
-				}));
-			}
-			list.appendChild(item);
-		});
-	}
-
-	async function renderAudit() {
-		var data = await api("GET", "/admin/audit?limit=30");
-		var body = $("audit");
-		clear(body);
-		data.entries.forEach(function (e) {
-			body.appendChild(el("tr", {}, [
-				el("td", { text: date(e.at) }),
-				el("td", { text: e.action }),
-				el("td", { text: e.actor }),
-				el("td", { text: e.outcome, class: e.outcome === "ok" ? "ok" : "bad" })
-			]));
-		});
 	}
 
 	// ---------- Chaves de API ----------
@@ -356,27 +318,6 @@ export const SETUP_JS = String.raw`(function () {
 		});
 	}
 
-	$("apikey-form").addEventListener("submit", async function (ev) {
-		ev.preventDefault();
-		var data = await busy(ev.submitter, function () {
-			return api("POST", "/admin/chaves", { nome: $("apikey-name").value || undefined, escopo: $("apikey-scope").value });
-		});
-		$("apikey-value").value = data.chave.valor;
-		$("apikey-box").hidden = false;
-		$("apikey-copy").textContent = "Copiar chave";
-		$("apikey-name").value = "";
-		await renderKeys();
-	});
-
-	$("apikey-copy").addEventListener("click", async function () {
-		$("apikey-value").select();
-		try {
-			await navigator.clipboard.writeText($("apikey-value").value);
-			$("apikey-copy").textContent = "Copiada";
-		} catch (e) {
-			document.execCommand("copy");
-		}
-	});
 	// ---------- Notas emitidas ----------
 
 	var ARQUIVOS = { nfse: "XML da NFS-e", dps: "XML da DPS", cancelamento: "Evento de cancelamento" };
@@ -471,14 +412,47 @@ export const SETUP_JS = String.raw`(function () {
 		});
 	}
 
+	// ---------- Atualização ----------
+
+	async function renderUpdate(verificar) {
+		var u = await api("GET", "/admin/atualizacao" + (verificar ? "?verificar=1" : ""));
+		var texto = "Versão instalada: " + u.instalada + ". ";
+		if (!u.publicada) texto += "Não foi possível consultar a versão publicada agora.";
+		else if (u.haAtualizacao) texto += "Há uma versão nova disponível: " + u.publicada + ".";
+		else texto += "Este cofre está atualizado.";
+		$("update-status").textContent = texto;
+		$("update-status").className = u.haAtualizacao ? "warn" : "";
+		// Sem conseguir consultar a versão publicada, o botão continua disponível.
+		$("update-run").hidden = !(u.gatilhoConfigurado && (u.haAtualizacao || !u.publicada));
+		$("update-run").textContent = u.haAtualizacao ? "Atualizar para " + u.publicada : "Atualizar agora";
+		$("update-setup").open = !u.gatilhoConfigurado;
+		$("update-setup").querySelector("summary").textContent = u.gatilhoConfigurado
+			? "Trocar o gatilho de atualização"
+			: "Configurar o gatilho de atualização";
+	}
+
+	async function renderAudit() {
+		var data = await api("GET", "/admin/audit?limit=30");
+		var body = $("audit");
+		clear(body);
+		data.entries.forEach(function (e) {
+			body.appendChild(el("tr", {}, [
+				el("td", { text: date(e.at) }),
+				el("td", { text: e.action }),
+				el("td", { text: e.actor }),
+				el("td", { text: e.outcome, class: e.outcome === "ok" ? "ok" : "bad" })
+			]));
+		});
+	}
+
 	async function refresh() {
 		state = await api("GET", "/admin/status");
-		$("version").textContent = "Cofre NFapi v" + state.version + " · protocolo " + state.protocol;
+		$("version").textContent = "Cofre NFapi v" + state.version;
 		renderCertificate();
 		renderEnvironment();
-		renderPairings();
 		await renderKeys();
 		await renderNotes();
+		await renderUpdate(false);
 		await renderAudit();
 	}
 
@@ -544,59 +518,54 @@ export const SETUP_JS = String.raw`(function () {
 		await renderAudit();
 	});
 
-	$("register-form").addEventListener("submit", async function (ev) {
-		ev.preventDefault();
-		$("reg-key-box").hidden = true;
-		message("reg-message", "Criando a conta… a API vai consultar este cofre.");
-		try {
-			var data = await busy(ev.submitter, function () {
-				return api("POST", "/admin/register", { email: $("reg-email").value, apiUrl: $("reg-api").value });
-			});
-			$("reg-key").value = data.chave;
-			$("reg-key-box").hidden = false;
-			$("reg-copy").textContent = "Copiar chave de API";
-			message("reg-message", "Conta criada" + (data.conta && data.conta.nome ? " para " + data.conta.nome : "") + ". Este cofre já está conectado.", "ok");
-			await refresh();
-		} catch (err) {
-			message("reg-message", err.message, "error");
-		}
-	});
-
-	$("reg-copy").addEventListener("click", async function () {
-		$("reg-key").select();
-		try {
-			await navigator.clipboard.writeText($("reg-key").value);
-			$("reg-copy").textContent = "Copiada";
-		} catch (e) {
-			document.execCommand("copy");
-		}
-	});
-
-	$("pair-form").addEventListener("submit", async function (ev) {
+	$("apikey-form").addEventListener("submit", async function (ev) {
 		ev.preventDefault();
 		var data = await busy(ev.submitter, function () {
-			return api("POST", "/admin/pairings", { label: $("pair-label").value });
+			return api("POST", "/admin/chaves", { nome: $("apikey-name").value || undefined, escopo: $("apikey-scope").value });
 		});
-		$("pair-code").value = data.code;
-		$("pair-code-box").hidden = false;
-		$("pair-label").value = "";
-		await refresh();
+		$("apikey-value").value = data.chave.valor;
+		$("apikey-box").hidden = false;
+		$("apikey-copy").textContent = "Copiar chave";
+		$("apikey-name").value = "";
+		await renderKeys();
 	});
 
-	$("pair-copy").addEventListener("click", async function () {
-		$("pair-code").select();
-		try {
-			await navigator.clipboard.writeText($("pair-code").value);
-			$("pair-copy").textContent = "Copiado";
-		} catch (e) {
-			document.execCommand("copy");
-		}
+	$("apikey-copy").addEventListener("click", function () {
+		copiar($("apikey-value"), $("apikey-copy"), "Copiada");
 	});
 
 	$("env-toggle").addEventListener("click", async function (ev) {
 		var next = !state.allowProduction;
-		if (next && !confirm("Liberar a produção? A partir de agora o cofre assina notas com valor fiscal.")) return;
+		if (next && !confirm("Liberar a produção? A partir de agora o cofre emite notas com valor fiscal.")) return;
 		await busy(ev.currentTarget, function () { return api("PUT", "/admin/settings", { allowProduction: next }); });
 		await refresh();
+	});
+
+	$("update-check").addEventListener("click", async function (ev) {
+		message("update-message", "");
+		await busy(ev.currentTarget, function () { return renderUpdate(true); });
+	});
+
+	$("update-run").addEventListener("click", async function (ev) {
+		if (!confirm("Atualizar o cofre agora? Ele continua funcionando durante o build; a nova versão entra no ar em um ou dois minutos.")) return;
+		try {
+			var data = await busy(ev.currentTarget, function () { return api("POST", "/admin/atualizacao"); });
+			message("update-message", data.mensagem + " Recarregue esta página depois.", "ok");
+		} catch (err) {
+			message("update-message", err.message, "error");
+		}
+		await renderAudit();
+	});
+
+	$("hook-form").addEventListener("submit", async function (ev) {
+		ev.preventDefault();
+		try {
+			await busy(ev.submitter, function () { return api("PUT", "/admin/atualizacao/gatilho", { url: $("hook-url").value.trim() }); });
+			$("hook-url").value = "";
+			message("update-message", "Gatilho salvo.", "ok");
+			await renderUpdate(false);
+		} catch (err) {
+			message("update-message", err.message, "error");
+		}
 	});
 })();`;

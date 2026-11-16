@@ -100,88 +100,6 @@ export async function deleteCertificate(db: D1Database): Promise<void> {
 	await db.prepare("DELETE FROM certificate WHERE id = 1").run();
 }
 
-// ---------- Pareamentos ----------
-
-export interface Pairing {
-	id: string;
-	label: string;
-	createdAt: string;
-	lastUsedAt: string | null;
-	revokedAt: string | null;
-}
-
-interface PairingRow {
-	id: string;
-	label: string;
-	created_at: number;
-	last_used_at: number | null;
-	revoked_at: number | null;
-}
-
-const rowToPairing = (r: PairingRow): Pairing => ({
-	id: r.id,
-	label: r.label,
-	createdAt: iso(r.created_at),
-	lastUsedAt: r.last_used_at ? iso(r.last_used_at) : null,
-	revokedAt: r.revoked_at ? iso(r.revoked_at) : null,
-});
-
-export async function createPairing(db: D1Database, label: string): Promise<Pairing> {
-	const id = crypto.randomUUID().replace(/-/g, "");
-	const now = Date.now();
-	await db
-		.prepare("INSERT INTO pairing (id, label, created_at) VALUES (?, ?, ?)")
-		.bind(id, label, now)
-		.run();
-	return { id, label, createdAt: iso(now), lastUsedAt: null, revokedAt: null };
-}
-
-export async function listPairings(db: D1Database): Promise<Pairing[]> {
-	const { results } = await db
-		.prepare("SELECT * FROM pairing ORDER BY created_at DESC")
-		.all<PairingRow>();
-	return results.map(rowToPairing);
-}
-
-export async function isPairingActive(db: D1Database, id: string): Promise<boolean> {
-	const row = await db
-		.prepare("SELECT id FROM pairing WHERE id = ? AND revoked_at IS NULL")
-		.bind(id)
-		.first();
-	return row !== null;
-}
-
-export async function touchPairing(db: D1Database, id: string): Promise<void> {
-	await db.prepare("UPDATE pairing SET last_used_at = ? WHERE id = ?").bind(Date.now(), id).run();
-}
-
-export async function revokePairing(db: D1Database, id: string): Promise<boolean> {
-	const res = await db
-		.prepare("UPDATE pairing SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL")
-		.bind(Date.now(), id)
-		.run();
-	return res.meta.changes > 0;
-}
-
-// ---------- Proteção contra repetição ----------
-
-/** Registra o nonce; devolve false se ele já foi usado. */
-export async function consumeNonce(db: D1Database, nonce: string, ttlSeconds: number): Promise<boolean> {
-	const now = Math.floor(Date.now() / 1000);
-	const res = await db
-		.prepare("INSERT OR IGNORE INTO nonces (nonce, expires_at) VALUES (?, ?)")
-		.bind(nonce, now + ttlSeconds)
-		.run();
-	return res.meta.changes > 0;
-}
-
-export async function purgeNonces(db: D1Database): Promise<void> {
-	await db
-		.prepare("DELETE FROM nonces WHERE expires_at < ?")
-		.bind(Math.floor(Date.now() / 1000))
-		.run();
-}
-
 // ---------- Configurações ----------
 
 export async function getAllowProduction(db: D1Database): Promise<boolean> {
@@ -396,7 +314,7 @@ export async function listNotas(db: D1Database, limit = 100): Promise<Nota[]> {
 	return [...notas.values()].sort((a, b) => b.emitidaEm.localeCompare(a.emitidaEm)).slice(0, limit);
 }
 
-/** Grava a troca completa com o governo. Chamado antes de responder à central. */
+/** Grava a troca completa com o governo, antes de a emissão seguir adiante. */
 export async function writeJournal(
 	bucket: R2Bucket,
 	entry: Record<string, unknown>,

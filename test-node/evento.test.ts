@@ -11,6 +11,7 @@ import { CancelamentoInput, gzipBase64, lerRespostaEvento, montarPedidoCancelame
 
 xmlRegisterFsInputProviders();
 const SCHEMAS = path.join(import.meta.dirname, "../schemas/nfse");
+// Chave fictícia, montada com o CNPJ de teste.
 const CHAVE = "35503082112223330001810000000000042261112345678907";
 
 function validar(xml: string, ambiente: Ambiente): string[] {

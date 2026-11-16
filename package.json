@@ -1,14 +1,14 @@
 {
   "name": "nfapi-cofre",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Cofre NFapi: guarda o certificado A1, assina XML, transmite com mTLS e arquiva os documentos fiscais na conta Cloudflare do emitente.",
+  "description": "Cofre NFapi: API de emissão de notas fiscais que roda na conta Cloudflare do emitente. Guarda o certificado A1, monta e assina os documentos, transmite com mTLS e arquiva os XML.",
   "license": "MIT",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler d1 migrations apply DB --remote && wrangler deploy",
-    "test": "vitest run && vitest run --config vitest.node.config.ts && node --test container/test/mtls.test.mjs",
+    "deploy": "node tools/atualizar.mjs && node tools/implantar.mjs",
+    "test": "vitest run && vitest run --config vitest.node.config.ts && node --test container/test/mtls.test.mjs tools/test/atualizar.test.mjs",
     "testar-certificado": "node tools/testar-certificado.mjs",
     "typecheck": "wrangler types && tsc --noEmit",
     "cf-typegen": "wrangler types"

@@ -69,11 +69,6 @@ function problema(error: z.ZodError): string {
 	return campo ? `Campo "${campo}": ${issue?.message}` : (issue?.message ?? "Requisição inválida.");
 }
 
-/** Caminhos atendidos por chave de API (o restante de /v1 segue outro esquema). */
-export function ehApiDeCliente(path: string): boolean {
-	return path === "/v1/nfse" || path.startsWith("/v1/nfse/");
-}
-
 async function autenticar(c: C): Promise<banco.ApiKey | Response> {
 	const header = c.req.header("authorization") ?? "";
 	const valor = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
@@ -198,7 +193,7 @@ export function registrarApiNfse(app: Hono<Ctx>, makeTransport: (env: AppEnv) =>
 
 /**
  * Cancelamento pedido pelo painel do emitente. Devolve null quando a nota não
- * foi emitida por este cofre (notas antigas, emitidas pela API central).
+ * foi emitida por este cofre.
  */
 export async function cancelarPeloPainel(
 	c: C,

@@ -85,7 +85,7 @@ beforeEach(async () => {
 	sefin.chamadas = [];
 	sefin.responder = autorizar;
 	await env.DB.batch(
-		["emissions", "series", "api_keys", "certificate", "pairing", "nonces", "settings", "audit", "documents"].map((t) =>
+		["emissions", "series", "api_keys", "certificate", "settings", "audit", "documents"].map((t) =>
 			env.DB.prepare(`DELETE FROM ${t}`),
 		),
 	);
@@ -224,7 +224,7 @@ describe("o cofre como API de emissão", () => {
 		expect(outra.erro.codigo).toBe("nfse_rejeitada");
 	});
 
-	it("exige chave de API válida e não interfere nas rotas antigas", async () => {
+	it("exige chave de API válida, e a chave não dá acesso ao painel", async () => {
 		expect((await cliente("POST", "/v1/nfse", undefined, pedido())).status).toBe(401);
 		expect((await cliente("GET", "/v1/nfse", "nfapi_chave-inexistente-000000000000000000000000000")).status).toBe(401);
 		// O segredo do cofre não é chave de API.
@@ -246,8 +246,9 @@ describe("o cofre como API de emissão", () => {
 		expect(JSON.stringify((await env.DB.prepare("SELECT * FROM api_keys").all()).results)).not.toContain(chave);
 		expect((await app.request(`${COFRE}/admin/chaves`, {}, env)).status).toBe(401);
 
-		// As rotas assinadas por HMAC (versão anterior) continuam exigindo a assinatura.
-		expect((await cliente("GET", "/v1/health", chave)).status).toBe(401);
+		// A chave de API não abre o painel do emitente.
+		expect((await cliente("GET", "/admin/status", chave)).status).toBe(401);
+		expect((await cliente("GET", "/admin/notas", chave)).status).toBe(401);
 	});
 
 	it("sem certificado instalado, explica o que falta", async () => {

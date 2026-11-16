@@ -32,11 +32,6 @@ async function certificateKey(secret: string): Promise<CryptoKey> {
 	);
 }
 
-/** Chave HMAC de um pareamento: derivada, nunca gravada. */
-export async function pairingKey(secret: string, pairingId: string): Promise<Uint8Array<ArrayBuffer>> {
-	return new Uint8Array(await hkdfBits(secret, `pairing/v1/${pairingId}`));
-}
-
 const AAD = encoder.encode("nfapi-cofre/certificate/v1");
 
 export async function encryptJson(
