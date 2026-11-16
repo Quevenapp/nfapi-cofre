@@ -96,6 +96,14 @@ export const SETUP_HTML = String.raw`<!doctype html>
 		</section>
 
 		<section class="card">
+			<h2>Notas emitidas</h2>
+			<p class="muted small">Os arquivos ficam neste cofre. O cancelamento é pedido à API do NFapi e registrado na SEFIN; o município define o prazo em que ele é aceito.</p>
+			<p id="notes-empty" class="muted" hidden>Nenhuma nota arquivada neste cofre ainda.</p>
+			<ul id="notes" class="notes"></ul>
+			<p id="notes-message" role="status"></p>
+		</section>
+
+		<section class="card">
 			<h2>Atividade recente</h2>
 			<div class="table-wrap">
 				<table>
@@ -160,6 +168,15 @@ dd { margin: 0; overflow-wrap: anywhere; }
 .results li { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 0; border-top: 1px solid var(--line); flex-wrap: wrap; }
 .results li button { margin-top: 0; padding: 6px 12px; }
 .results .detail { display: block; color: var(--muted); font-size: 0.875rem; overflow-wrap: anywhere; }
+.notes { list-style: none; margin: 0; padding: 0; }
+.notes > li { padding: 14px 0; border-top: 1px solid var(--line); }
+.notes .head { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-weight: 600; }
+.notes .detail { display: block; color: var(--muted); font-size: 0.875rem; overflow-wrap: anywhere; }
+.notes .acts { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.notes .acts button { margin-top: 0; padding: 6px 12px; font-size: 0.9rem; }
+.notes .cancel-form { margin-top: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; }
+.badge { display: inline-block; padding: 1px 10px; border-radius: 999px; border: 1px solid currentColor; font-size: 0.8rem; font-weight: 700; white-space: nowrap; }
+select { width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; }
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
 th, td { text-align: left; padding: 6px 10px 6px 0; border-top: 1px solid var(--line); white-space: nowrap; }
@@ -291,12 +308,107 @@ export const SETUP_JS = String.raw`(function () {
 		});
 	}
 
+	// ---------- Notas emitidas ----------
+
+	var ARQUIVOS = { nfse: "XML da NFS-e", dps: "XML da DPS", cancelamento: "Evento de cancelamento" };
+
+	async function baixar(arquivo) {
+		var res = await fetch("/admin/notas/arquivo?key=" + encodeURIComponent(arquivo.key), {
+			headers: { authorization: "Bearer " + secret }
+		});
+		if (!res.ok) throw new Error("Não foi possível baixar o arquivo (HTTP " + res.status + ").");
+		var url = URL.createObjectURL(await res.blob());
+		var link = el("a", { href: url, download: arquivo.nome });
+		document.body.appendChild(link);
+		link.click();
+		link.remove();
+		URL.revokeObjectURL(url);
+	}
+
+	function formCancelar(nota, item) {
+		var motivo = el("select", {}, [
+			el("option", { value: "erro_emissao", text: "Erro na emissão" }),
+			el("option", { value: "servico_nao_prestado", text: "Serviço não prestado" }),
+			el("option", { value: "outros", text: "Outros" })
+		]);
+		var justificativa = el("textarea", { rows: "2", maxlength: "255", placeholder: "Explique o motivo (mínimo de 15 caracteres)" });
+		var confirmar = el("button", { type: "button", class: "ghost danger", text: "Confirmar cancelamento" });
+		var desistir = el("button", { type: "button", class: "ghost", text: "Voltar" });
+		var form = el("div", { class: "cancel-form" }, [
+			el("label", { text: "Motivo" }), motivo,
+			el("label", { text: "Justificativa" }), justificativa,
+			el("div", { class: "row" }, [confirmar, desistir])
+		]);
+		desistir.addEventListener("click", function () { form.remove(); });
+		confirmar.addEventListener("click", async function () {
+			if (justificativa.value.trim().length < 15) return message("notes-message", "A justificativa precisa ter ao menos 15 caracteres.", "error");
+			if (!confirm("Cancelar esta nota? O cancelamento é registrado na SEFIN e não pode ser desfeito.")) return;
+			message("notes-message", "Registrando o cancelamento na SEFIN…");
+			try {
+				await busy(confirmar, function () {
+					return api("POST", "/admin/notas/cancelar", {
+						chaveAcesso: nota.chaveAcesso, motivo: motivo.value, justificativa: justificativa.value.trim()
+					});
+				});
+				message("notes-message", "Nota cancelada.", "ok");
+				await renderNotes();
+				await renderAudit();
+			} catch (err) {
+				message("notes-message", err.message, "error");
+			}
+		});
+		item.appendChild(form);
+		justificativa.focus();
+	}
+
+	async function renderNotes() {
+		var data = await api("GET", "/admin/notas");
+		var list = $("notes");
+		clear(list);
+		$("notes-empty").hidden = data.notas.length > 0;
+		data.notas.forEach(function (n) {
+			var titulo = (n.numeroNfse ? "NFS-e nº " + n.numeroNfse : "NFS-e") +
+				(n.serie ? " · série " + n.serie + ", DPS " + n.numeroDps : "");
+			var cancelada = n.situacao === "cancelada";
+			var detalhe = "Chave " + n.chaveAcesso +
+				" · " + (n.ambiente === "producao" ? "produção" : "homologação") +
+				(n.valor !== null ? " · R$ " + n.valor.toFixed(2).replace(".", ",") : "") +
+				" · emitida em " + date(n.emitidaEm) +
+				(cancelada && n.canceladaEm ? " · cancelada em " + date(n.canceladaEm) : "");
+			var acts = el("div", { class: "acts" });
+			n.arquivos.forEach(function (a) {
+				var botao = el("button", { type: "button", class: "ghost", text: ARQUIVOS[a.tipo] || a.nome });
+				botao.addEventListener("click", function () {
+					busy(botao, function () { return baixar(a); }).catch(function (err) { message("notes-message", err.message, "error"); });
+				});
+				acts.appendChild(botao);
+			});
+			var item = el("li", {}, [
+				el("div", { class: "head" }, [
+					el("span", { text: titulo }),
+					el("span", { class: "badge " + (cancelada ? "bad" : "ok"), text: cancelada ? "Cancelada" : "Autorizada" })
+				]),
+				el("span", { class: "detail", text: detalhe }),
+				acts
+			]);
+			if (!cancelada) {
+				var cancelar = el("button", { type: "button", class: "ghost danger", text: "Cancelar nota" });
+				cancelar.addEventListener("click", function () {
+					if (!item.querySelector(".cancel-form")) formCancelar(n, item);
+				});
+				acts.appendChild(cancelar);
+			}
+			list.appendChild(item);
+		});
+	}
+
 	async function refresh() {
 		state = await api("GET", "/admin/status");
 		$("version").textContent = "Cofre NFapi v" + state.version + " · protocolo " + state.protocol;
 		renderCertificate();
 		renderEnvironment();
 		renderPairings();
+		await renderNotes();
 		await renderAudit();
 	}
 

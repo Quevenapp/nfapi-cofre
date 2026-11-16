@@ -198,6 +198,15 @@ export async function setAllowProduction(db: D1Database, allow: boolean): Promis
 		.run();
 }
 
+export async function getSetting(db: D1Database, key: string): Promise<string | null> {
+	const row = await db.prepare("SELECT value FROM settings WHERE key = ?").bind(key).first<{ value: string }>();
+	return row?.value ?? null;
+}
+
+export async function setSetting(db: D1Database, key: string, value: string): Promise<void> {
+	await db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind(key, value).run();
+}
+
 // ---------- Auditoria ----------
 
 export interface AuditEntry {
@@ -308,6 +317,83 @@ export async function listDocuments(
 		meta: JSON.parse(r.meta) as Record<string, unknown>,
 		createdAt: iso(r.created_at),
 	}));
+}
+
+// ---------- Notas emitidas (visão do emitente) ----------
+
+export interface NotaArquivo {
+	tipo: string;
+	key: string;
+	nome: string;
+	tamanho: number;
+}
+
+export interface Nota {
+	chaveAcesso: string;
+	ambiente: string | null;
+	numeroNfse: string | null;
+	serie: string | null;
+	numeroDps: number | null;
+	valor: number | null;
+	emitidaEm: string;
+	situacao: "autorizada" | "cancelada";
+	canceladaEm: string | null;
+	arquivos: NotaArquivo[];
+}
+
+/**
+ * Agrupa os documentos arquivados por nota (chave de acesso). A situação vem
+ * dos próprios arquivos: se há evento de cancelamento arquivado, está cancelada.
+ */
+export async function listNotas(db: D1Database, limit = 100): Promise<Nota[]> {
+	const docs = await listDocuments(db, { prefix: "nfse/", limit: 200 });
+	const notas = new Map<string, Nota>();
+	// Do mais antigo para o mais novo, para a nota nascer antes dos seus eventos.
+	for (const doc of [...docs].reverse()) {
+		const meta = doc.meta as Record<string, unknown>;
+		const chave = typeof meta.chaveAcesso === "string" ? meta.chaveAcesso : null;
+		if (!chave) continue;
+		let nota = notas.get(chave);
+		if (!nota) {
+			nota = {
+				chaveAcesso: chave,
+				// Sem metadado de ambiente (notas antigas), o caminho do arquivo informa.
+				ambiente: typeof meta.ambiente === "string" ? meta.ambiente : (doc.key.split("/")[1] ?? null),
+				numeroNfse: null,
+				serie: null,
+				numeroDps: null,
+				valor: null,
+				emitidaEm: doc.createdAt,
+				situacao: "autorizada",
+				canceladaEm: null,
+				arquivos: [],
+			};
+			notas.set(chave, nota);
+		}
+		const tipo = typeof meta.tipo === "string" ? meta.tipo : "arquivo";
+		if (tipo === "nfse") {
+			nota.numeroNfse = meta.numeroNfse ? String(meta.numeroNfse) : nota.numeroNfse;
+			nota.serie = meta.serie ? String(meta.serie) : nota.serie;
+			nota.numeroDps = typeof meta.numeroDps === "number" ? meta.numeroDps : nota.numeroDps;
+			nota.valor = typeof meta.valor === "number" ? meta.valor : nota.valor;
+			nota.emitidaEm = typeof meta.emitidaEm === "string" ? meta.emitidaEm : doc.createdAt;
+		}
+		if (tipo === "cancelamento") {
+			nota.situacao = "cancelada";
+			nota.canceladaEm = typeof meta.canceladaEm === "string" ? meta.canceladaEm : doc.createdAt;
+		}
+		nota.arquivos.push({
+			tipo,
+			key: doc.key,
+			nome: doc.key.split("/").pop() ?? doc.key,
+			tamanho: doc.size,
+		});
+	}
+	// A nota primeiro, depois a DPS e os eventos.
+	const ordem = ["nfse", "dps", "cancelamento"];
+	const posicao = (tipo: string) => (ordem.includes(tipo) ? ordem.indexOf(tipo) : ordem.length);
+	for (const nota of notas.values()) nota.arquivos.sort((a, b) => posicao(a.tipo) - posicao(b.tipo));
+	return [...notas.values()].sort((a, b) => b.emitidaEm.localeCompare(a.emitidaEm)).slice(0, limit);
 }
 
 /** Grava a troca completa com o governo. Chamado antes de responder à central. */

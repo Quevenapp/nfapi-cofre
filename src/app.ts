@@ -22,6 +22,7 @@ import {
 	VAULT_VERSION,
 	encodePairingCode,
 	sha256Hex,
+	signRequest,
 	toHex,
 	verifySignature,
 } from "./protocol";
@@ -278,6 +279,10 @@ export function createApp(makeTransport: (env: AppEnv) => Transport, deps: AppDe
 			);
 		}
 
+		// Guarda com qual API e por qual pareamento este cofre fala (usado pelo
+		// painel de notas para pedir cancelamentos).
+		await store.setSetting(c.env.DB, "api_url", api.origin);
+		await store.setSetting(c.env.DB, "api_pairing", pairing.id);
 		await store.audit(c.env.DB, {
 			action: "cadastro",
 			actor: "admin",
@@ -332,6 +337,89 @@ export function createApp(makeTransport: (env: AppEnv) => Transport, deps: AppDe
 			detail: { results: results.map((r) => ({ host: r.host, ok: r.ok })) },
 		});
 		return c.json({ results });
+	});
+
+	// ---------- Notas emitidas (painel do emitente) ----------
+
+	app.get("/admin/notas", async (c) => c.json({ notas: await store.listNotas(c.env.DB) }));
+
+	// Download de um arquivo da nota (XML da NFS-e, da DPS ou do evento).
+	app.get("/admin/notas/arquivo", async (c) => {
+		const key = c.req.query("key") ?? "";
+		if (!store.isValidDocumentKey(key) || !key.startsWith("nfse/")) {
+			return fail(c, 400, "chave_invalida", "Arquivo inválido.");
+		}
+		const object = await store.getDocument(c.env.DOCS, key);
+		if (!object) return fail(c, 404, "nao_encontrado", "Arquivo inexistente.");
+		const nome = (key.split("/").pop() ?? "arquivo.xml").replace(/[^A-Za-z0-9._-]/g, "_");
+		return c.body(object.body, 200, {
+			"content-type": object.httpMetadata?.contentType ?? "application/octet-stream",
+			"content-disposition": `attachment; filename="${nome}"`,
+		});
+	});
+
+	// Cancelamento: o cofre pede à API, assinando com a chave do pareamento. A
+	// API monta o evento e volta a este cofre para assinar, transmitir e arquivar.
+	app.post("/admin/notas/cancelar", async (c) => {
+		const input = parseJson<{ chaveAcesso?: unknown; motivo?: unknown; justificativa?: unknown }>(
+			await c.req.arrayBuffer(),
+		);
+		if (typeof input?.chaveAcesso !== "string" || typeof input.motivo !== "string" || typeof input.justificativa !== "string") {
+			return fail(c, 400, "requisicao_invalida", "Informe a chave de acesso, o motivo e a justificativa.");
+		}
+
+		const apiUrl = (await store.getSetting(c.env.DB, "api_url")) ?? DEFAULT_API_URL;
+		let pairingId = await store.getSetting(c.env.DB, "api_pairing");
+		if (!pairingId || !(await store.isPairingActive(c.env.DB, pairingId))) {
+			// Cofres conectados antes desta versão (ou pelo administrador): usa o pareamento ativo mais recente.
+			pairingId = (await store.listPairings(c.env.DB)).find((p) => !p.revokedAt)?.id ?? null;
+		}
+		if (!pairingId) {
+			return fail(c, 409, "sem_pareamento", "Este cofre não está conectado à API do NFapi.");
+		}
+
+		const path = "/cofre/nfse/cancelar";
+		const body = new TextEncoder().encode(
+			JSON.stringify({ chaveAcesso: input.chaveAcesso, motivo: input.motivo, justificativa: input.justificativa }),
+		);
+		const assinatura = await signRequest({
+			key: await pairingKey(c.env.VAULT_SECRET, pairingId),
+			pairingId,
+			method: "POST",
+			path,
+			body,
+		});
+
+		let res: Response;
+		try {
+			res = await callApi(apiUrl + path, {
+				method: "POST",
+				headers: { ...assinatura, "content-type": "application/json" },
+				body,
+			});
+		} catch (err) {
+			return fail(c, 502, "api_inacessivel", `Não foi possível falar com a API: ${err instanceof Error ? err.message : String(err)}`);
+		}
+		const json = (await res.json().catch(() => null)) as {
+			erro?: { codigo?: string; mensagem?: string };
+			mensagens?: { codigo?: string; descricao?: string }[];
+		} | null;
+		await store.audit(c.env.DB, {
+			action: "nota.cancelar",
+			actor: "admin",
+			outcome: res.ok ? "ok" : (json?.erro?.codigo ?? `http_${res.status}`),
+			detail: { chaveAcesso: input.chaveAcesso, motivo: input.motivo },
+		});
+		if (!res.ok) {
+			const detalhes = (json?.mensagens ?? []).map((m) => `[${m.codigo}] ${m.descricao}`).join(" ");
+			return fail(
+				c,
+				(STATUSES.includes(res.status) ? res.status : 502) as Status,
+				json?.erro?.codigo ?? "cancelamento_recusado",
+				detalhes || json?.erro?.mensagem || `A API respondeu HTTP ${res.status}.`,
+			);
+		}
+		return c.json(json ?? { ok: true });
 	});
 
 	app.get("/admin/audit", async (c) => {
