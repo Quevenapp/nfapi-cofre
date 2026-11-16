@@ -8,7 +8,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler d1 migrations apply DB --remote && wrangler deploy",
-    "test": "vitest run && node --test container/test/mtls.test.mjs",
+    "test": "vitest run && vitest run --config vitest.node.config.ts && node --test container/test/mtls.test.mjs",
     "testar-certificado": "node tools/testar-certificado.mjs",
     "typecheck": "wrangler types && tsc --noEmit",
     "cf-typegen": "wrangler types"
@@ -26,12 +26,14 @@
     "@xmldom/xmldom": "^0.9.12",
     "hono": "^4.13.18",
     "node-forge": "^1.4.3",
-    "xml-crypto": "^6.4.0"
+    "xml-crypto": "^6.4.0",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.8.2",
     "@types/node": "^26.6.6",
     "@types/node-forge": "^1.3.14",
+    "libxml2-wasm": "^0.7.2",
     "typescript": "^7.0.2",
     "vitest": "^5.1.0",
     "wrangler": "^4.162.0"

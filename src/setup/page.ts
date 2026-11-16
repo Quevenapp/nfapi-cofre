@@ -57,8 +57,29 @@ export const SETUP_HTML = String.raw`<!doctype html>
 		</section>
 
 		<section class="card">
-			<h2>3. Conectar à API NFapi</h2>
-			<p>Crie a sua conta no NFapi a partir deste cofre. A API confere o certificado instalado, cria a conta e devolve a sua chave de API.</p>
+			<h2>3. Chaves de API</h2>
+			<p>Os seus sistemas emitem notas chamando este cofre direto, com uma chave de API. Endereço da API: <code id="api-base"></code></p>
+			<form id="apikey-form">
+				<label for="apikey-name">Nome da chave (ex.: o sistema que vai usá-la)</label>
+				<input id="apikey-name" type="text" maxlength="80" placeholder="Meu sistema">
+				<label for="apikey-scope">O que a chave pode fazer</label>
+				<select id="apikey-scope">
+					<option value="completo">Homologação e produção</option>
+					<option value="homologacao">Somente homologação (testes)</option>
+				</select>
+				<button type="submit">Criar chave de API</button>
+			</form>
+			<div id="apikey-box" hidden>
+				<p class="warn">Copie agora: a chave aparece uma única vez.</p>
+				<textarea id="apikey-value" readonly rows="2"></textarea>
+				<button type="button" id="apikey-copy" class="ghost">Copiar chave</button>
+			</div>
+			<ul id="apikeys" class="results"></ul>
+		</section>
+
+		<section class="card">
+			<h2>Conta na API central (opcional)</h2>
+			<p class="muted small">Recurso da versão anterior, em que a emissão passava por uma API central. Não é necessário para emitir por este cofre.</p>
 			<form id="register-form">
 				<label for="reg-email">Seu e-mail</label>
 				<input id="reg-email" type="email" maxlength="200" autocomplete="email" required>
@@ -213,7 +234,8 @@ export const SETUP_JS = String.raw`(function () {
 		var res = await fetch(path, init);
 		var json = await res.json().catch(function () { return null; });
 		if (!res.ok) {
-			var err = new Error((json && json.error && json.error.message) || ("Erro HTTP " + res.status));
+			var detalhe = json && ((json.error && json.error.message) || (json.erro && json.erro.mensagem));
+			var err = new Error(detalhe || ("Erro HTTP " + res.status));
 			err.status = res.status;
 			throw err;
 		}
@@ -308,6 +330,53 @@ export const SETUP_JS = String.raw`(function () {
 		});
 	}
 
+	// ---------- Chaves de API ----------
+
+	async function renderKeys() {
+		$("api-base").textContent = location.origin + "/v1/nfse";
+		var data = await api("GET", "/admin/chaves");
+		var list = $("apikeys");
+		clear(list);
+		data.chaves.forEach(function (k) {
+			var detalhe = k.prefixo + "… · " + (k.escopo === "homologacao" ? "somente homologação" : "homologação e produção") +
+				" · criada em " + date(k.criadaEm) +
+				(k.revogadaEm ? " · revogada em " + date(k.revogadaEm) : (k.ultimoUso ? " · último uso " + date(k.ultimoUso) : " · nunca usada"));
+			var item = el("li", {}, [el("span", {}, [el("strong", { text: k.nome }), el("span", { class: "detail", text: detalhe })])]);
+			if (!k.revogadaEm) {
+				item.appendChild(el("button", {
+					type: "button", class: "ghost danger", text: "Revogar",
+					onclick: async function (ev) {
+						if (!confirm("Revogar a chave \"" + k.nome + "\"? O sistema que a usa deixa de conseguir emitir.")) return;
+						await busy(ev.currentTarget, function () { return api("DELETE", "/admin/chaves/" + k.id); });
+						await renderKeys();
+					}
+				}));
+			}
+			list.appendChild(item);
+		});
+	}
+
+	$("apikey-form").addEventListener("submit", async function (ev) {
+		ev.preventDefault();
+		var data = await busy(ev.submitter, function () {
+			return api("POST", "/admin/chaves", { nome: $("apikey-name").value || undefined, escopo: $("apikey-scope").value });
+		});
+		$("apikey-value").value = data.chave.valor;
+		$("apikey-box").hidden = false;
+		$("apikey-copy").textContent = "Copiar chave";
+		$("apikey-name").value = "";
+		await renderKeys();
+	});
+
+	$("apikey-copy").addEventListener("click", async function () {
+		$("apikey-value").select();
+		try {
+			await navigator.clipboard.writeText($("apikey-value").value);
+			$("apikey-copy").textContent = "Copiada";
+		} catch (e) {
+			document.execCommand("copy");
+		}
+	});
 	// ---------- Notas emitidas ----------
 
 	var ARQUIVOS = { nfse: "XML da NFS-e", dps: "XML da DPS", cancelamento: "Evento de cancelamento" };
@@ -408,6 +477,7 @@ export const SETUP_JS = String.raw`(function () {
 		renderCertificate();
 		renderEnvironment();
 		renderPairings();
+		await renderKeys();
 		await renderNotes();
 		await renderAudit();
 	}

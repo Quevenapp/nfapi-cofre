@@ -7,6 +7,7 @@
 // emitente, transmitir para o governo e guardar documentos.
 
 import { type Context, Hono, type MiddlewareHandler } from "hono";
+import { cancelarPeloPainel, ehApiDeCliente, registrarApiNfse } from "./api-nfse";
 import { isAdminSecret, pairingKey, secretIsStrong } from "./crypto";
 import { PfxError, parsePfx } from "./pfx";
 import {
@@ -38,7 +39,7 @@ export interface AppEnv {
 	VAULT_SECRET: string;
 }
 
-type Ctx = { Bindings: AppEnv; Variables: { body: ArrayBuffer; actor: string } };
+export type Ctx = { Bindings: AppEnv; Variables: { body: ArrayBuffer; actor: string } };
 type C = Context<Ctx>;
 type Status = 400 | 401 | 403 | 404 | 409 | 413 | 422 | 429 | 500 | 502 | 503 | 504;
 
@@ -368,6 +369,11 @@ export function createApp(makeTransport: (env: AppEnv) => Transport, deps: AppDe
 			return fail(c, 400, "requisicao_invalida", "Informe a chave de acesso, o motivo e a justificativa.");
 		}
 
+		// Notas emitidas por este cofre são canceladas aqui mesmo, sem passar por outro serviço.
+		const local = await cancelarPeloPainel(c, makeTransport(c.env), input.chaveAcesso, input);
+		if (local) return local;
+
+		// Notas antigas, emitidas pela API central: o pedido segue para ela.
 		const apiUrl = (await store.getSetting(c.env.DB, "api_url")) ?? DEFAULT_API_URL;
 		let pairingId = await store.getSetting(c.env.DB, "api_pairing");
 		if (!pairingId || !(await store.isPairingActive(c.env.DB, pairingId))) {
@@ -430,6 +436,8 @@ export function createApp(makeTransport: (env: AppEnv) => Transport, deps: AppDe
 	// ---------- API central (HMAC) ----------
 
 	app.use("/v1/*", async (c, next) => {
+		// A API dos sistemas clientes (/v1/nfse) autentica por chave de API, em api-nfse.ts.
+		if (ehApiDeCliente(c.req.path)) return next();
 		const pairingId = c.req.header(HEADERS.pairing) ?? "";
 		const timestamp = c.req.header(HEADERS.timestamp) ?? "";
 		const nonce = c.req.header(HEADERS.nonce) ?? "";
@@ -652,6 +660,8 @@ export function createApp(makeTransport: (env: AppEnv) => Transport, deps: AppDe
 			"content-length": String(object.size),
 		});
 	});
+
+	registrarApiNfse(app, makeTransport);
 
 	return app;
 }
