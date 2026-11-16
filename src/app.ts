@@ -39,11 +39,19 @@ export interface AppEnv {
 
 type Ctx = { Bindings: AppEnv; Variables: { body: ArrayBuffer; actor: string } };
 type C = Context<Ctx>;
-type Status = 400 | 401 | 403 | 404 | 409 | 413 | 422 | 500 | 502 | 503 | 504;
+type Status = 400 | 401 | 403 | 404 | 409 | 413 | 422 | 429 | 500 | 502 | 503 | 504;
 
 const MAX_BODY_BYTES = 10 * 1024 * 1024;
 const MAX_PFX_BYTES = 64 * 1024;
-const STATUSES: readonly number[] = [400, 401, 403, 404, 409, 413, 422, 500, 502, 503, 504];
+const STATUSES: readonly number[] = [400, 401, 403, 404, 409, 413, 422, 429, 500, 502, 503, 504];
+
+/** API usada pelo botão "Criar minha conta" quando o emitente não informa outra. */
+export const DEFAULT_API_URL = "https://api.nfapi.queven.app";
+
+export interface AppDeps {
+	/** Como o cofre alcança a API no cadastro. Trocado nos testes. */
+	fetch?: typeof fetch;
+}
 
 function fail(c: C, status: Status, code: string, message: string) {
 	return c.json<ErrorBody>({ error: { code, message } }, status);
@@ -67,8 +75,9 @@ function parseJson<T>(body: ArrayBuffer): T | undefined {
 	}
 }
 
-export function createApp(makeTransport: (env: AppEnv) => Transport) {
+export function createApp(makeTransport: (env: AppEnv) => Transport, deps: AppDeps = {}) {
 	const app = new Hono<Ctx>();
+	const callApi: typeof fetch = deps.fetch ?? ((input, init) => fetch(input, init));
 
 	app.onError((err, c) => {
 		console.error("erro não tratado:", err instanceof Error ? err.message : err);
@@ -195,6 +204,93 @@ export function createApp(makeTransport: (env: AppEnv) => Transport) {
 		});
 		// O código só é exibido agora; depois não há como recuperá-lo.
 		return c.json({ pairing, code });
+	});
+
+	// Autoatendimento: cria a conta do emitente na API do NFapi e já deixa este
+	// cofre pareado. O cofre gera o pareamento, entrega o código à API e mostra
+	// ao emitente a chave de API devolvida (uma única vez).
+	app.post("/admin/register", async (c) => {
+		const input = parseJson<{ email?: unknown; apiUrl?: unknown }>(await c.req.arrayBuffer());
+		const email = typeof input?.email === "string" ? input.email.trim() : "";
+		if (email.length > 200 || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+			return fail(c, 400, "requisicao_invalida", "Informe um e-mail válido.");
+		}
+		let api: URL;
+		try {
+			const informado = typeof input?.apiUrl === "string" ? input.apiUrl.trim() : "";
+			api = new URL(informado || DEFAULT_API_URL);
+		} catch {
+			return fail(c, 400, "requisicao_invalida", "Endereço da API inválido.");
+		}
+		if (api.protocol !== "https:" || api.username || api.password || !api.hostname.includes(".")) {
+			return fail(c, 400, "requisicao_invalida", "O endereço da API precisa ser https.");
+		}
+		if (!(await store.getCertificateInfo(c.env.DB))) {
+			return fail(c, 409, "certificado_ausente", "Instale o certificado antes de criar a conta.");
+		}
+
+		const pairing = await store.createPairing(c.env.DB, `Conta NFapi (${email})`.slice(0, 80));
+		const key = await pairingKey(c.env.VAULT_SECRET, pairing.id);
+		const code = encodePairingCode({
+			v: 1,
+			url: new URL(c.req.url).origin,
+			id: pairing.id,
+			key: toHex(key),
+		});
+
+		// Se o cadastro não der certo, o pareamento recém-criado não fica solto.
+		const desistir = async (status: Status, codigo: string, mensagem: string) => {
+			await store.revokePairing(c.env.DB, pairing.id);
+			await store.audit(c.env.DB, {
+				action: "cadastro",
+				actor: "admin",
+				outcome: codigo,
+				detail: { api: api.host },
+			});
+			return fail(c, status, codigo, mensagem);
+		};
+
+		let res: Response;
+		try {
+			res = await callApi(`${api.origin}/v1/cadastro`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({ codigoPareamento: code, email }),
+			});
+		} catch (err) {
+			return desistir(
+				502,
+				"api_inacessivel",
+				`Não foi possível falar com a API: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+		const body = (await res.json().catch(() => null)) as {
+			erro?: { codigo?: string; mensagem?: string };
+			conta?: { id?: string; nome?: string; email?: string };
+			chave?: { chave?: string };
+			emitente?: { id?: string };
+		} | null;
+		if (!res.ok || !body?.chave?.chave) {
+			return desistir(
+				(STATUSES.includes(res.status) ? res.status : 502) as Status,
+				body?.erro?.codigo ?? "cadastro_recusado",
+				body?.erro?.mensagem ?? `A API respondeu HTTP ${res.status}.`,
+			);
+		}
+
+		await store.audit(c.env.DB, {
+			action: "cadastro",
+			actor: "admin",
+			outcome: "ok",
+			// A chave de API nunca entra na auditoria.
+			detail: { api: api.host, conta: body.conta?.id ?? null, pairing: pairing.id },
+		});
+		return c.json({
+			api: api.origin,
+			conta: body.conta ?? null,
+			emitente: body.emitente?.id ?? null,
+			chave: body.chave.chave,
+		});
 	});
 
 	app.delete("/admin/pairings/:id", async (c) => {

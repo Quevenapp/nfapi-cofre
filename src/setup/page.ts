@@ -58,7 +58,23 @@ export const SETUP_HTML = String.raw`<!doctype html>
 
 		<section class="card">
 			<h2>3. Conectar à API NFapi</h2>
-			<p>Gere um código de pareamento e envie-o à API do NFapi (<code>POST /v1/emitentes</code>). Ele autoriza a API a pedir assinaturas e transmissões a este cofre.</p>
+			<p>Crie a sua conta no NFapi a partir deste cofre. A API confere o certificado instalado, cria a conta e devolve a sua chave de API.</p>
+			<form id="register-form">
+				<label for="reg-email">Seu e-mail</label>
+				<input id="reg-email" type="email" maxlength="200" autocomplete="email" required>
+				<label for="reg-api">Endereço da API</label>
+				<input id="reg-api" type="url" value="https://api.nfapi.queven.app" required>
+				<button type="submit">Criar minha conta</button>
+			</form>
+			<p id="reg-message" role="status"></p>
+			<div id="reg-key-box" hidden>
+				<p class="warn">Copie agora: a chave de API aparece uma única vez.</p>
+				<textarea id="reg-key" readonly rows="2"></textarea>
+				<button type="button" id="reg-copy" class="ghost">Copiar chave de API</button>
+			</div>
+
+			<h3>Já tem conta?</h3>
+			<p class="muted small">Gere um código de pareamento e envie-o à API (<code>POST /v1/emitentes</code>) ou ao administrador. Ele autoriza a API a pedir assinaturas e transmissões a este cofre.</p>
 			<form id="pair-form">
 				<label for="pair-label">Nome desta conexão</label>
 				<input id="pair-label" type="text" maxlength="80" placeholder="API NFapi">
@@ -122,7 +138,8 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 0.9em; }
 .ok { color: var(--ok); }
 .warn { color: var(--warn); font-weight: 600; }
 label { display: block; font-weight: 600; font-size: 0.9rem; margin: 12px 0 4px; }
-input[type="text"], input[type="password"], input[type="file"], textarea {
+h3 { font-size: 0.95rem; margin: 22px 0 6px; }
+input[type="text"], input[type="password"], input[type="email"], input[type="url"], input[type="file"], textarea {
 	width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px;
 	background: var(--bg); color: var(--text); font: inherit;
 }
@@ -343,6 +360,34 @@ export const SETUP_JS = String.raw`(function () {
 			list.appendChild(el("li", { class: "bad", text: err.message }));
 		}
 		await renderAudit();
+	});
+
+	$("register-form").addEventListener("submit", async function (ev) {
+		ev.preventDefault();
+		$("reg-key-box").hidden = true;
+		message("reg-message", "Criando a conta… a API vai consultar este cofre.");
+		try {
+			var data = await busy(ev.submitter, function () {
+				return api("POST", "/admin/register", { email: $("reg-email").value, apiUrl: $("reg-api").value });
+			});
+			$("reg-key").value = data.chave;
+			$("reg-key-box").hidden = false;
+			$("reg-copy").textContent = "Copiar chave de API";
+			message("reg-message", "Conta criada" + (data.conta && data.conta.nome ? " para " + data.conta.nome : "") + ". Este cofre já está conectado.", "ok");
+			await refresh();
+		} catch (err) {
+			message("reg-message", err.message, "error");
+		}
+	});
+
+	$("reg-copy").addEventListener("click", async function () {
+		$("reg-key").select();
+		try {
+			await navigator.clipboard.writeText($("reg-key").value);
+			$("reg-copy").textContent = "Copiada";
+		} catch (e) {
+			document.execCommand("copy");
+		}
 	});
 
 	$("pair-form").addEventListener("submit", async function (ev) {

@@ -17,14 +17,16 @@ O Container exige o plano **Workers Paid** (US$ 5/mês) na sua conta Cloudflare.
 
 ## Instalação
 
-1. Clique em **Deploy to Cloudflare** e siga os passos.
-2. Quando for pedido o segredo `VAULT_SECRET`, gere um valor aleatório e guarde-o em local seguro:
+O passo a passo completo, com gerador do segredo, está em **<https://nfapi.queven.app/instalar>**. Em resumo:
+
+1. Gere o segredo do cofre (`VAULT_SECRET`) na página acima, ou com o comando abaixo, e guarde-o em local seguro:
 
    ```bash
    openssl rand -hex 32
    ```
 
    Ele cifra o certificado e é a senha da tela de configuração. Se for perdido, será preciso reinstalar o certificado.
+2. Clique em **Deploy to Cloudflare**. No campo `VAULT_SECRET`, apague o que o navegador tiver preenchido sozinho e cole o segredo. Deixe **Proteger com Cloudflare Access** desligado.
 3. Abra `https://<seu-cofre>/setup`, entre com o segredo e:
    - envie o arquivo `.pfx` do certificado A1 e a senha dele;
    - rode o **teste de conexão**, que consulta os serviços de homologação;

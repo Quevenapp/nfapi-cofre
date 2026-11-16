@@ -3,7 +3,7 @@
 	"name": "nfapi-cofre",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-11-01",
-	"compatibility_flags": ["nodejs_compat"],
+	"compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
 	"observability": { "enabled": true },
 
 	// Segredo obrigatório: o deploy falha se não estiver definido.

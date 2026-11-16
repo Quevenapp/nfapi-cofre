@@ -272,6 +272,73 @@ describe("documentos", () => {
 	});
 });
 
+describe("cadastro na API (Criar minha conta)", () => {
+	type Chamada = { url: string; body: { codigoPareamento: string; email: string } };
+
+	/** Cofre ligado a uma API simulada que responde o que o teste mandar. */
+	function comApi(resposta: () => Response) {
+		const chamadas: Chamada[] = [];
+		const cofre = createApp(() => transport, {
+			fetch: async (input, init) => {
+				chamadas.push({ url: String(input), body: JSON.parse(String(init?.body)) as Chamada["body"] });
+				return resposta();
+			},
+		});
+		const registrar = (body: unknown) =>
+			cofre.request(
+				`${ORIGIN}/admin/register`,
+				{ method: "POST", body: JSON.stringify(body), headers: { authorization: `Bearer ${env.VAULT_SECRET}` } },
+				env,
+			);
+		return { chamadas, registrar };
+	}
+	const ativos = async () =>
+		(await env.DB.prepare("SELECT COUNT(*) AS n FROM pairing WHERE revoked_at IS NULL").first<{ n: number }>())?.n;
+
+	it("entrega o código de pareamento à API e devolve a chave ao emitente", async () => {
+		await instalarCertificado();
+		const { chamadas, registrar } = comApi(() =>
+			Response.json({ conta: { id: "cta_1", nome: "Empresa" }, chave: { chave: "nfapi_chave-de-teste" }, emitente: { id: "emi_1" } }, { status: 201 }),
+		);
+		const res = await registrar({ email: "dono@exemplo.test" });
+		expect(res.status).toBe(200);
+		expect(await res.json()).toMatchObject({ api: "https://api.nfapi.queven.app", chave: "nfapi_chave-de-teste" });
+
+		// Sem endereço informado, usa a API padrão; o código aponta para este cofre.
+		expect(chamadas).toHaveLength(1);
+		expect(chamadas[0]?.url).toBe("https://api.nfapi.queven.app/v1/cadastro");
+		expect(chamadas[0]?.body.email).toBe("dono@exemplo.test");
+		expect(decodePairingCode(chamadas[0]?.body.codigoPareamento ?? "").url).toBe(ORIGIN);
+		expect(await ativos()).toBe(1);
+
+		const auditoria = await env.DB.prepare("SELECT detail FROM audit WHERE action = 'cadastro'").first<{ detail: string }>();
+		expect(auditoria?.detail).not.toContain("nfapi_chave-de-teste");
+	});
+
+	it("se a API recusar, repassa o motivo e revoga o pareamento criado", async () => {
+		await instalarCertificado();
+		const { registrar } = comApi(() =>
+			Response.json({ erro: { codigo: "email_ja_cadastrado", mensagem: "Já existe uma conta com este e-mail." } }, { status: 409 }),
+		);
+		const res = await registrar({ email: "dono@exemplo.test" });
+		expect(res.status).toBe(409);
+		expect(await erro(res)).toBe("email_ja_cadastrado");
+		expect(await ativos()).toBe(0);
+	});
+
+	it("não chama a API sem certificado, com e-mail inválido ou com endereço inseguro", async () => {
+		const { chamadas, registrar } = comApi(() => Response.json({}, { status: 500 }));
+		expect(await erro(await registrar({ email: "dono@exemplo.test" }))).toBe("certificado_ausente");
+
+		await instalarCertificado();
+		expect((await registrar({ email: "sem-arroba" })).status).toBe(400);
+		expect((await registrar({ email: "dono@exemplo.test", apiUrl: "http://api.exemplo.test" })).status).toBe(400);
+		expect((await registrar({ email: "dono@exemplo.test", apiUrl: "nao é url" })).status).toBe(400);
+		expect(chamadas).toHaveLength(0);
+		expect(await ativos()).toBe(0);
+	});
+});
+
 describe("auditoria", () => {
 	it("registra as operações sem guardar conteúdo de documento", async () => {
 		await instalarCertificado();
